@@ -1,0 +1,1 @@
+{"bin":{"ego-browser":"./bin/ego-browser"},"description":"Linux port of the ego-browser harness: CDP virtual native-binding layer (route B) driving a stock Chromium, reusing the MIT-licensed ego-browser TypeScript runtime from citrolabs/ego-lite.","engines":{"node":">=22"},"license":"MIT","name":"ego-browser-linux","type":"module","version":"0.6.0.16-linux.1"}

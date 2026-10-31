@@ -1,0 +1,695 @@
+#!/usr/bin/env node
+/**
+ * ego-browser (Linux) — CLI launcher.
+ *
+ * Original re-implementation of the ego(lite) ego-browser CLI surface
+ * (see ANALYSIS.md §1.3 for the interface spec recovered from the macOS binary).
+ * Subcommands: help / skill / nodejs / import / upgrade.
+ *
+ * Node >= 22. Keep this file dependency-free (node:* only).
+ */
+import { createRequire } from "node:module";
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { homedir, tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { refreshManagedEntrySkill, runFirstRun } from "./src/first-run.js";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+
+function readVersion() {
+  try {
+    return readFileSync(join(HERE, "VERSION"), "utf8").trim() || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+const VERSION = readVersion();
+
+function fail(message, code = 1) {
+  process.stderr.write(`${message}\n`);
+  process.exit(code);
+}
+
+function out(text) {
+  try {
+    process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+  } catch (err) {
+    if (err && err.code === "EPIPE") process.exit(0);
+    throw err;
+  }
+}
+// A downstream `| head` closing the pipe must not crash the CLI.
+process.stdout.on("error", (err) => {
+  if (err && err.code === "EPIPE") process.exit(0);
+  throw err;
+});
+
+// ---------------------------------------------------------------------------
+// help texts (CLI surface parity with the macOS ego-browser launcher)
+// ---------------------------------------------------------------------------
+
+const HELP_GENERAL = `Usage:
+  ego-browser help [topic]
+  ego-browser import list
+  ego-browser import --browser <browser> [--profile <dir-name> ...]
+  ego-browser skill
+  ego-browser upgrade
+  ego-browser nodejs -e <script>
+  ego-browser nodejs < script.js
+Topics:
+  import                     Import browser profiles and related data
+  skill                      Print the usage guide for this ego lite version
+  upgrade                    Update ego lite to the latest version
+  nodejs -e/--eval           Embedded Node runtime usage
+Eval Options:
+  -e, --eval <script>        Execute JavaScript with the embedded Node runtime
+Global Options:
+  --help, -h                 Show general or topic help
+  --version, -v              Show version
+  --ego-server-name=<name>   Connect to the matching named browser service
+                             Up to 64 ASCII letters, digits, '-', '_', or '.'
+`;
+
+const HELP_IMPORT = `ego-browser import - Import browser profiles and related data
+Usage:
+  ego-browser import list
+  ego-browser import --browser <browser> [--profile <dir-name> ...]
+                 [--browser <browser> [--profile <dir-name> ...] ...]
+                 [--clear-existing-profiles] [--no-default]
+Current support:
+  chrome                     Import from Google Chrome
+  chromium                   Import from Chromium
+  brave                      Import from Brave
+Options:
+  --clear-existing-profiles  Remove all existing Ego profiles after a successful import, then continue
+  --no-default               Do not set Ego as the default browser after import
+`;
+
+const HELP_SKILL = `ego-browser skill - Print the usage guide for this ego lite version
+Usage:
+  ego-browser skill
+  ego-browser skill --sdk-path <path>
+Options:
+  --sdk-path <path>            Print the guide in \`ego-browser/SKILL.md\` next
+                               to this SDK instead of the bundled guide
+`;
+
+const HELP_UPGRADE = `ego-browser upgrade - Update ego lite to the latest version
+Usage:
+  ego-browser upgrade
+Notes:
+  Triggers ego lite's self-update (check, download, install) and prints the
+  result. On Linux this re-syncs the open-source SDK/skill from the upstream
+  repo checkout (../repo, or $EGO_REPO_DIR): git fetch, rebase of local port
+  commits, SDK bundle rebuild, vendor copy re-sync, installed entry-skill
+  refresh, VERSION bump. The pinned Chromium build is intentionally left
+  alone; entry skills the user installed themselves are never overwritten.
+`;
+
+const HELP_NODEJS = `ego-browser nodejs - Execute JavaScript with the embedded Node runtime
+Usage:
+  ego-browser nodejs
+  ego-browser nodejs -e <script>
+  ego-browser nodejs --eval <script>
+  ego-browser nodejs --sdk-path <path> -e <script>
+  ego-browser nodejs < script.js
+Options:
+  -e, --eval <script>          Execute the provided script text
+  --sdk-path <path>            Load the Ego Node SDK before evaluation
+Notes:
+  A single REPL input can be up to 64 MiB (67108864 bytes).
+  With TTY stdin and no source script, ego-browser starts an interactive REPL.
+  Type \`.exit\` or press Ctrl-D to leave the REPL.
+  In the interactive REPL, type \`.cell\` on its own line to start a multiline
+  block, \`.end\` to execute it, or \`.cancel\` to discard it.
+  When stdin is piped and no command is provided, ego-browser forwards the stdin
+  payload to the embedded Node runtime as a script.
+`;
+
+const HELP_TOPICS = {
+  import: HELP_IMPORT,
+  skill: HELP_SKILL,
+  upgrade: HELP_UPGRADE,
+  "nodejs -e/--eval": HELP_NODEJS,
+  nodejs: HELP_NODEJS,
+};
+
+// ---------------------------------------------------------------------------
+// argument parsing
+// ---------------------------------------------------------------------------
+
+function parseGlobal(argv) {
+  // Returns { command, commandArgs, egoServerName, version, help }.
+  const out = {
+    command: null,
+    commandArgs: [],
+    egoServerName: null,
+    version: false,
+    help: false,
+  };
+  const rest = [];
+  for (const arg of argv) {
+    if (arg === "--version" || arg === "-v") out.version = true;
+    else if (arg === "--help" || arg === "-h") out.help = true;
+    else if (arg.startsWith("--ego-server-name=")) {
+      const name = arg.slice("--ego-server-name=".length);
+      if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+        fail("Invalid --ego-server-name value");
+      }
+      out.egoServerName = name;
+    } else rest.push(arg);
+  }
+  if (rest.length > 0) {
+    out.command = rest[0];
+    out.commandArgs = rest.slice(1);
+  }
+  return out;
+}
+
+function splitCommandFlags(args, { evalAllowed }) {
+  // Minimal flag splitter for subcommands. Returns { flags, positionals }.
+  const flags = { eval: null, sdkPath: null };
+  const positionals = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((a === "-e" || a === "--eval") && evalAllowed) {
+      const v = args[i + 1];
+      if (v === undefined || v.startsWith("-")) {
+        fail("error: -e/--eval requires a script argument");
+      }
+      flags.eval = v;
+      i++;
+    } else if (a.startsWith("--eval=") && evalAllowed) {
+      flags.eval = a.slice("--eval=".length);
+    } else if (a === "--sdk-path") {
+      const v = args[i + 1];
+      if (v === undefined) fail("error: --sdk-path requires a path argument");
+      flags.sdkPath = v;
+      i++;
+    } else if (a.startsWith("--sdk-path=")) {
+      flags.sdkPath = a.slice("--sdk-path=".length);
+    } else if (a === "-e" || a === "--eval") {
+      fail("error: -e/--eval must be used with `ego-cli nodejs`");
+    } else {
+      positionals.push(a);
+    }
+  }
+  return { flags, positionals };
+}
+
+// ---------------------------------------------------------------------------
+// sdk / skill guide resolution
+// ---------------------------------------------------------------------------
+
+function debugOverrideDir() {
+  return join(homedir(), ".local", "share", "citro-labs", "debug");
+}
+
+function bundledSdkDir() {
+  return join(HERE, "sdk");
+}
+
+function guidePathForSdkDir(sdkDir) {
+  return join(sdkDir, "ego-browser", "SKILL.md");
+}
+
+/** Resolve the SDK dir for `skill` / `nodejs` per the documented order.
+ * --sdk-path accepts either the SDK directory or the index.js file itself
+ * (docs/local-runtime-development.md uses `--sdk-path "$PWD/dist/out/index.js`). */
+function resolveSdkDir(explicitSdkPath) {
+  if (explicitSdkPath) {
+    let p = resolve(explicitSdkPath);
+    try {
+      if (statSync(p).isFile()) p = dirname(p);
+    } catch {
+      // Nonexistent: downstream existence checks produce the error.
+    }
+    return { dir: p, source: "sdk-path" };
+  }
+  const debugIndex = join(debugOverrideDir(), "index.js");
+  if (existsSync(debugIndex)) {
+    return { dir: debugOverrideDir(), source: "debug-sdk" };
+  }
+  return { dir: bundledSdkDir(), source: "bundled" };
+}
+
+function cmdSkill(args) {
+  const { flags, positionals } = splitCommandFlags(args, { evalAllowed: false });
+  if (positionals.length > 0) {
+    fail(`ego-browser usage guide not found: ${positionals[0]}`);
+  }
+  const { dir, source } = resolveSdkDir(flags.sdkPath);
+  const guidePath = guidePathForSdkDir(dir);
+  if (!existsSync(guidePath)) {
+    fail(`ego-browser usage guide not found: ${guidePath}`);
+  }
+  if (source === "sdk-path" || source === "debug-sdk") {
+    out(
+      `[ego-browser:skill] source=${source} dir=${dir} (override, not the bundled guide)`,
+    );
+  }
+  out(readFileSync(guidePath, "utf8"));
+}
+
+function cmdHelp(args) {
+  const topic = args.join(" ").trim();
+  if (!topic) {
+    out(HELP_GENERAL);
+    return;
+  }
+  const text = HELP_TOPICS[topic];
+  if (text) out(text);
+  else fail(`Unknown help topic: ${topic}`);
+}
+
+// ---------------------------------------------------------------------------
+// nodejs: real script execution through the CDP virtual binding layer
+// ---------------------------------------------------------------------------
+
+async function readStdinText() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function runNodeScript(scriptText, sdkDir) {
+  const bundlePath = join(sdkDir, "index.js");
+  if (!existsSync(bundlePath)) {
+    fail(`ego-browser SDK not found: ${bundlePath}`);
+  }
+  // Daemon modules live in src/; loaded lazily so pure-CLI paths
+  // (help/skill/version) stay dependency-free and fast.
+  const { STATE_PATH } = await import("./src/chromium.js");
+  const { BrowserPool } = await import("./src/browser-pool.js");
+  const { EgoBindings } = await import("./src/ego-bindings.js");
+  const pool = new BrowserPool();
+  const bindings = await EgoBindings.create(pool, STATE_PATH);
+  // globalThis.ego is the closed-source app's native binding surface;
+  // our CDP-backed virtual implementation lives on the bindings object,
+  // routed per task-space profile through the browser pool (one Chromium
+  // instance per ego profile, so spaces of a profile share its cookie jar
+  // like the original).
+  globalThis.ego = bindings;
+  // Warm the Default profile's browser: the SDK page ledger keys Page
+  // labels to a browser-instance id that is stable for one browser run.
+  // The native app hosts Node inside the browser process (stable ppid);
+  // our per-invocation Node processes do not, so the launcher supplies
+  // the id explicitly (see src/page-ledger.ts in the SDK). Note: with
+  // multiple profiles, spaces on non-Default profiles use their own
+  // browser instance ids, which the ledger does not track per profile
+  // (documented limitation in progress.md).
+  await pool.forProfile("Default");
+  process.env.EGO_BROWSER_INSTANCE_ID = pool.instanceId("Default");
+  // Mirror the original's [ego-browser:notice] update hint. In the macOS app
+  // the SDK's installEgoSdk() (browser-embedded path) prints it at startup
+  // whenever getBrowserVersion() reports updateAvailable (SDK
+  // src/update-notice.ts; message format pinned by its test). Our direct-CLI
+  // path goes through runMain()/execute(), whose per-script resetSink()
+  // deterministically discards the SDK-buffered notice, so the launcher emits
+  // the identical line itself, in the same leading position. If upstream
+  // ever changes the message, re-sync this format string.
+  try {
+    const ver = await bindings.getBrowserVersion();
+    if (
+      ver &&
+      ver.updateAvailable === true &&
+      typeof ver.currentVersion === "string" &&
+      ver.currentVersion.trim().length > 0
+    ) {
+      process.stdout.write(
+        `[ego-browser:notice] Ego Lite update is available ` +
+          `(current ${ver.currentVersion.trim()}). Finish the current browser task, ` +
+          "then ask the user before running `ego-browser upgrade`; re-read the " +
+          "ego-browser Skill afterward.\n",
+      );
+    }
+  } catch {
+    // The update hint must never fail the browser task (same contract as
+    // the SDK's emitUpdateNotice).
+  }
+  let exitCode = 0;
+  try {
+    const bundle = await import(pathToFileURL(bundlePath).href);
+    if (typeof bundle.runMain !== "function") {
+      fail("ego-browser SDK bundle does not export runMain");
+    }
+    exitCode = await bundle.runMain({
+      argv: [],
+      stdinText: scriptText,
+      stdout: process.stdout,
+      stderr: process.stderr,
+    });
+    if (typeof bundle.disposeEgoSdk === "function") {
+      await bundle.disposeEgoSdk().catch(() => {});
+    }
+  } finally {
+    pool.closeAll();
+  }
+  return exitCode;
+}
+
+async function cmdNodejs(args) {
+  const { flags, positionals } = splitCommandFlags(args, { evalAllowed: true });
+  const sources = [];
+  if (flags.eval !== null) sources.push("-e/--eval");
+  if (positionals.length > 0) sources.push("file");
+  if (sources.length > 1) {
+    fail("error: `ego-cli nodejs` accepts at most one source argument");
+  }
+  // An explicit source (-e / file) wins over piped stdin; without any
+  // explicit source, piped stdin is forwarded as the script (original
+  // behavior), as is an empty stdin (the runtime prints its usage then).
+  const { dir: sdkDir } = resolveSdkDir(flags.sdkPath);
+  let script;
+  if (flags.eval !== null) script = flags.eval;
+  else if (positionals.length > 0)
+    script = readFileSync(resolve(positionals[0]), "utf8");
+  else script = await readStdinText();
+  process.exitCode = await runNodeScript(script, sdkDir);
+}
+
+async function cmdImport(args) {
+  const { listSourceBrowsers, formatSourceList, importProfiles } =
+    await import("./src/import-profiles.js");
+  if (args.length === 1 && args[0] === "list") {
+    out(formatSourceList(await listSourceBrowsers()));
+    return;
+  }
+  const groups = [];
+  let clearExisting = false;
+  let noDefault = false;
+  let current = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--browser") {
+      const b = args[++i];
+      if (!b) fail("error: --browser requires a browser name");
+      current = { browser: b, profileDirs: [] };
+      groups.push(current);
+    } else if (a.startsWith("--browser=")) {
+      current = { browser: a.slice("--browser=".length), profileDirs: [] };
+      groups.push(current);
+    } else if (a === "--profile") {
+      const p = args[++i];
+      if (!p) fail("error: --profile requires a profile directory name");
+      if (!current) fail("error: --profile must follow --browser <browser>");
+      current.profileDirs.push(p);
+    } else if (a.startsWith("--profile=")) {
+      if (!current) fail("error: --profile must follow --browser <browser>");
+      current.profileDirs.push(a.slice("--profile=".length));
+    } else if (a === "--clear-existing-profiles") {
+      clearExisting = true;
+    } else if (a === "--no-default") {
+      noDefault = true;
+    } else {
+      fail(`error: unexpected argument for ego-browser import: ${a}`);
+    }
+  }
+  try {
+    const { imported } = await importProfiles(groups, {
+      clearExistingProfiles: clearExisting,
+    });
+    for (const p of imported) out(`imported profile ${p.id} from ${p.sourcePath}`);
+    if (noDefault) {
+      out(
+        "(note: --no-default accepted; ego-browser never changes the system default browser on Linux)",
+      );
+    }
+  } catch (err) {
+    fail(`ego-browser import: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// upgrade — the Linux self-update channel
+// ---------------------------------------------------------------------------
+// The original `ego-browser upgrade` triggers the browser-side updater
+// (macOS: Keystone against update.citrolabs.ai) and prints the result.
+// Linux has no Keystone; the Linux port's equivalent channel re-syncs the
+// open-source ego-browser SDK/skill from the upstream repo checkout
+// (../repo, override with EGO_REPO_DIR): check (fetch), download (rebase the
+// local port commits onto the new upstream), install (rebuild the SDK bundle,
+// re-sync the vendor copy, refresh the installed entry skill, bump VERSION),
+// then print the result. Mirrors the original's check/download/install shape
+// (ANALYSIS.md §6.2); the pinned Chromium build is intentionally not touched.
+
+function upgradeRepoDir() {
+  return process.env.EGO_REPO_DIR || join(HERE, "..", "repo");
+}
+
+/** Run a command synchronously, capturing output. Never throws. */
+function runCmd(cmd, args, opts = {}) {
+  try {
+    const res = spawnSync(cmd, args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      encoding: "utf8",
+      timeout: opts.timeout ?? 120000,
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    return {
+      ok: res.status === 0,
+      stdout: (res.stdout || "").trim(),
+      stderr: (res.stderr || "").trim(),
+    };
+  } catch (err) {
+    return { ok: false, stdout: "", stderr: String((err && err.message) || err) };
+  }
+}
+
+/** Keep failure output readable: last N lines only. */
+function tailLines(text, n = 15) {
+  const lines = String(text || "").split("\n");
+  return lines.slice(Math.max(0, lines.length - n)).join("\n");
+}
+
+function gitCmd(repoDir, args, opts = {}) {
+  // Identity only matters if a rebase replays local commits; harmless otherwise.
+  return runCmd(
+    "git",
+    ["-c", "user.name=ego-linux-port", "-c", "user.email=ego-linux-port@localhost", ...args],
+    { cwd: repoDir, timeout: opts.timeout ?? 60000 },
+  );
+}
+
+function bumpPortVersion(v) {
+  const m = /^(.*)-linux\.(\d+)$/.exec(String(v || "").trim());
+  if (m) return `${m[1]}-linux.${parseInt(m[2], 10) + 1}`;
+  return `${String(v || "0.0.0").trim()}-linux.1`;
+}
+
+async function cmdUpgrade() {
+  const repoDir = upgradeRepoDir();
+  const pkgDir = join(repoDir, "package", "ego-browser");
+  if (!existsSync(join(repoDir, ".git")) || !existsSync(join(pkgDir, "package.json"))) {
+    fail(
+      `ego-browser upgrade: cannot find the ego-lite repo checkout at ${repoDir} ` +
+        `(set EGO_REPO_DIR to override).`,
+    );
+  }
+  const note = (m) => process.stderr.write(`ego-browser upgrade: ${m}\n`);
+
+  // -- check --
+  note("checking for updates…");
+  const fetch = gitCmd(repoDir, ["fetch", "origin"], { timeout: 120000 });
+  if (!fetch.ok) {
+    fail(`ego-browser upgrade: git fetch failed:\n${tailLines(fetch.stderr || fetch.stdout)}`);
+  }
+  const upstream =
+    gitCmd(repoDir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).stdout ||
+    "origin/main";
+  const localSha = gitCmd(repoDir, ["rev-parse", "HEAD"]).stdout;
+  const remoteSha = gitCmd(repoDir, ["rev-parse", upstream]).stdout;
+  if (!localSha || !remoteSha) {
+    fail("ego-browser upgrade: could not resolve the local/upstream revisions.");
+  }
+  if (localSha === remoteSha) {
+    out(`[ego-browser:upgrade] already up to date (${VERSION}; SDK from ${localSha.slice(0, 7)})`);
+    return;
+  }
+  // Commits on the upstream side that we do not have yet. Zero means there
+  // is nothing new to download — our own local port commits sitting on top
+  // (the normal state) do not count as "diverged".
+  const aheadCount = gitCmd(repoDir, ["rev-list", "--count", `${localSha}..${remoteSha}`]).stdout;
+  if (!/^\d+$/.test(aheadCount || "")) {
+    fail("ego-browser upgrade: could not compare the local/upstream revisions.");
+  }
+  if (aheadCount === "0") {
+    out(`[ego-browser:upgrade] already up to date (${VERSION}; SDK from ${localSha.slice(0, 7)})`);
+    return;
+  }
+
+  // -- download --
+  note(`updating ${localSha.slice(0, 7)} -> ${remoteSha.slice(0, 7)} (${aheadCount} upstream commits)…`);
+  const branch = upstream.includes("/") ? upstream.slice(upstream.indexOf("/") + 1) : upstream;
+  const pull = gitCmd(repoDir, ["pull", "--rebase", "--autostash", "origin", branch], {
+    timeout: 180000,
+  });
+  if (!pull.ok) {
+    gitCmd(repoDir, ["rebase", "--abort"]);
+    fail(`ego-browser upgrade: git pull --rebase failed:\n${tailLines(pull.stderr || pull.stdout)}`);
+  }
+  const newHead = gitCmd(repoDir, ["rev-parse", "HEAD"]).stdout.slice(0, 7);
+
+  // -- install: rebuild the SDK bundle --
+  const distOut = join(pkgDir, "dist", "out");
+  const backupDir = mkdtempSync(join(tmpdir(), "ego-upgrade-"));
+  if (existsSync(distOut)) cpSync(distOut, join(backupDir, "out"), { recursive: true });
+  const cleanupBackup = () => {
+    try {
+      rmSync(backupDir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  };
+  const manifestDiff = gitCmd(repoDir, [
+    "diff",
+    "--name-only",
+    localSha,
+    "HEAD",
+    "--",
+    "package/ego-browser/package.json",
+    "package/ego-browser/package-lock.json",
+  ]).stdout;
+  if (manifestDiff) {
+    note("dependency manifest changed; running npm ci…");
+    const ci = runCmd("npm", ["ci", "--no-audit", "--no-fund"], {
+      cwd: pkgDir,
+      timeout: 600000,
+    });
+    if (!ci.ok) {
+      cleanupBackup();
+      fail(`ego-browser upgrade: npm ci failed:\n${tailLines(ci.stderr || ci.stdout)}`);
+    }
+  }
+  note("rebuilding the SDK bundle…");
+  const build = runCmd("npm", ["run", "build"], { cwd: pkgDir, timeout: 300000 });
+  if (!build.ok) {
+    // Never leave a half-written bundle behind.
+    try {
+      rmSync(distOut, { recursive: true, force: true });
+      if (existsSync(join(backupDir, "out"))) cpSync(join(backupDir, "out"), distOut, { recursive: true });
+    } catch {
+      // best effort
+    }
+    cleanupBackup();
+    fail(
+      `ego-browser upgrade: SDK rebuild failed (previous bundle restored):\n${tailLines(build.stderr || build.stdout)}`,
+    );
+  }
+
+  // -- install: re-sync the vendor copy (fallback bundle if the repo is ever unbuilt) --
+  note("syncing the vendor copy…");
+  const vendorDir = join(HERE, "vendor", "ego-browser");
+  try {
+    rmSync(vendorDir, { recursive: true, force: true });
+    cpSync(pkgDir, vendorDir, {
+      recursive: true,
+      filter: (src) => !src.split("/").includes("node_modules"),
+    });
+  } catch (err) {
+    cleanupBackup();
+    fail(`ego-browser upgrade: vendor re-sync failed: ${(err && err.message) || err}`);
+  }
+
+  // -- install: refresh the installed entry skill (only ours) --
+  const bundledEntrySkill = join(bundledSdkDir(), "agent-skills", "ego-browser");
+  const oldGuide = join(backupDir, "out", "agent-skills", "ego-browser", "SKILL.md");
+  let skillStatus;
+  try {
+    skillStatus = refreshManagedEntrySkill(
+      bundledEntrySkill,
+      existsSync(oldGuide) ? oldGuide : null,
+    );
+  } catch (err) {
+    skillStatus = `refresh failed: ${(err && err.message) || err}`;
+  }
+  const skillReport = {
+    refreshed: "refreshed (~/.agents/skills/ego-browser)",
+    "adopted+refreshed":
+      "refreshed (~/.agents/skills/ego-browser; pre-marker install adopted)",
+    untouched: "untouched (not installed by this launcher; left alone)",
+    "source-missing": "not refreshed (bundled guide missing)",
+  }[skillStatus] || skillStatus;
+
+  // -- install: bump the port revision --
+  const newVersion = bumpPortVersion(VERSION);
+  try {
+    writeFileSync(join(HERE, "VERSION"), `${newVersion}\n`);
+  } catch (err) {
+    note(`warning: could not write VERSION: ${(err && err.message) || err}`);
+  }
+  cleanupBackup();
+
+  // -- print the result --
+  out(`[ego-browser:upgrade] SDK updated: ${localSha.slice(0, 7)} -> ${newHead}`);
+  out(`[ego-browser:upgrade] entry skill: ${skillReport}`);
+  out(`[ego-browser:upgrade] version: ${newVersion}`);
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  // Launch-time setup (Linux equivalent of the app's first-run behavior):
+  // entry Skill in ~/.agents/skills + ~/.local/bin PATH registration.
+  // Silent on success; never breaks the requested command.
+  runFirstRun(join(bundledSdkDir(), "agent-skills", "ego-browser"), join(HERE, "ego-browser"));
+
+  const parsed = parseGlobal(process.argv.slice(2));
+
+  if (parsed.version && !parsed.command) {
+    out(`ego-browser ${VERSION}`);
+    return;
+  }
+  if (parsed.help && !parsed.command) {
+    out(HELP_GENERAL);
+    return;
+  }
+  if (!parsed.command) {
+    // No subcommand: with piped stdin this would be the nodejs path;
+    // without a daemon there is nothing to run yet.
+    if (!process.stdin.isTTY) {
+      await cmdNodejs([]);
+      return;
+    }
+    out(HELP_GENERAL);
+    return;
+  }
+
+  const { command, commandArgs } = parsed;
+  switch (command) {
+    case "help":
+      cmdHelp(commandArgs);
+      break;
+    case "skill":
+      cmdSkill(commandArgs);
+      break;
+    case "nodejs":
+      await cmdNodejs(commandArgs);
+      break;
+    case "import":
+      await cmdImport(commandArgs);
+      break;
+    case "upgrade":
+      await cmdUpgrade();
+      break;
+    default:
+      fail(`Unknown command: ${command}`, 2);
+  }
+}
+
+await main();

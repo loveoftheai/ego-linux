@@ -1,0 +1,7 @@
+await useOrCreateTaskSpace('smoke')
+await gotoAndWait('https://example.com')
+console.log('info:', JSON.stringify(await pageInfo()))
+const raw = await ego.snapshot({})
+console.log('refs:', JSON.stringify(raw.refs))
+console.log('content-length:', raw.content.length)
+console.log(raw.content)

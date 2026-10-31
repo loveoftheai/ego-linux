@@ -1,0 +1,11 @@
+const task = await taskSpace('smoke-v2')
+const page = task.page('p1')
+await page.goto('https://example.com')
+console.log('--- page.snapshot() ---')
+const snap = await page.snapshot()
+console.log(snap)
+const ref = snap.match(/anchor "Learn more" \[ref=(\d+)/)[1]
+console.log(`--- click @${ref} ---`)
+await page.click('@' + ref)
+await page.waitForLoadState('load').catch(() => {})
+console.log('url after click:', await page.url())

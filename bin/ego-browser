@@ -1,0 +1,3 @@
+#!/bin/sh
+# ego-browser launcher shim (Linux port) — the real launcher is ../ego-browser.
+exec "$(dirname "$0")/../ego-browser" "$@"
