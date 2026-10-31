@@ -1766,6 +1766,15 @@ function buildCssCountJs(selector) {
             return __egoQueryAllOpenShadow(${JSON.stringify(selector)}).length;
           })()`;
 }
+function isRawSelector(input) {
+  if (typeof input !== "string" || input.trim().length === 0) return false;
+  if (parseRef(input)) return false;
+  try {
+    return parseLocatorOrThrow(input) === null;
+  } catch {
+    return false;
+  }
+}
 function buildSelectorCenterJs(selector) {
   const findExpr = buildFindElementJs(selector);
   return `(() => {
@@ -2105,6 +2114,8 @@ function send(cdp, method, params = {}, sessionId = void 0) {
 }
 export {
   ElementResolutionError,
+  buildSelectorCenterJs,
+  isRawSelector,
   resolveElementCenter,
   resolveElementObjectId,
   validateLocatorBackendNodes

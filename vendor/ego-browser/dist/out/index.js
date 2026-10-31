@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { existsSync, writeSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
-import { dirname, resolve, join, win32, isAbsolute, relative } from 'node:path';
-import { writeFile, mkdir, rm, copyFile, readdir, readFile, stat, rename } from 'node:fs/promises';
+import { existsSync, writeSync, readFileSync, rmSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, resolve, join, isAbsolute, win32, relative } from 'node:path';
+import { writeFile, mkdir, copyFile, rm, stat, readFile, readdir } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { loadEnvFile as loadEnvFile$1, stdout, stderr, stdin } from 'node:process';
 import { inspect } from 'node:util';
-import { tmpdir, homedir } from 'node:os';
+import { randomInt } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID } from 'node:crypto';
 import { setTimeout as setTimeout$1 } from 'node:timers/promises';
 
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
@@ -22,6 +22,14 @@ function agentWorkspace() {
         return bundledSkill;
     }
     return resolve(REPO_ROOT, "..", "..", "skills", "ego-browser");
+}
+/**
+ * Root of the per-user state ego-browser keeps between rounds: Page ledgers
+ * and the shared download directory.
+ */
+function runtimeStateDir() {
+    return resolvePath(process.env.EGO_BROWSER_STATE_DIR ||
+        join(homedir(), ".ego-browser", "state"));
 }
 function resolvePath(path) {
     if (path.startsWith("~")) {
@@ -88,13 +96,17 @@ function recordUnhandledPage(notice) {
     for (const listener of [...pageNoticeListeners])
         listener(merged);
 }
-/** Refresh the URL of an already-discovered Page without creating a new notice. */
+/**
+ * Refresh the URL of an already-discovered Page without creating a new notice.
+ * Listeners observe discoveries only: a popup waiter armed after the Page was
+ * discovered must not resolve with it when its URL settles later.
+ */
 function refreshUnhandledPageNotice(spaceId, targetId, url) {
     const key = pageKey(spaceId, targetId);
     const existing = pendingPageNotices.get(key);
     if (!existing)
         return;
-    recordUnhandledPage({ ...existing, url });
+    pendingPageNotices.set(key, { ...existing, url });
 }
 /** Mark a Page as used during this round so it needs no further guidance. */
 function markPageObserved(spaceId, targetId) {
@@ -6798,7 +6810,7 @@ function parse(input, options) {
 
 const option = (kind, description, values) => ({ kind, description, values });
 const timeout = option("positiveMilliseconds", "Maximum duration in milliseconds.");
-const actionTimeout = option("positiveMilliseconds", "Maximum wait for the element to become usable in milliseconds; defaults to 3000.");
+const actionTimeout = option("positiveMilliseconds", "Maximum wait for the element to become usable in milliseconds; defaults to 3000. A selector that matches nothing on an idle page fails before the timeout.");
 const delay = option("nonNegativeNumber", "Input delay in milliseconds.");
 const button = option("string", "Mouse button.", ["left", "middle", "right"]);
 const position = option("point", "CSS-pixel offset from the element's top-left corner.");
@@ -6940,7 +6952,7 @@ const PUBLIC_API_SCHEMA = [
     {
         name: "Page.goto",
         signature: "await page.goto(url, { referer?, timeout?, waitUntil? })",
-        summary: "Navigate this Page in place. Timeout errors report whether the new document committed, plus its URL and readyState when available.",
+        summary: "Navigate this Page in place. Timeout errors report whether the new document committed, plus its URL and readyState when available. A navigation that has not committed by the timeout is stopped so the Page stays usable on its previous document.",
         options: {
             referer: option("nonEmptyString", "HTTP Referer header for the navigation."),
             timeout,
@@ -6950,7 +6962,7 @@ const PUBLIC_API_SCHEMA = [
     {
         name: "Page.reload",
         signature: "await page.reload({ timeout?, waitUntil? })",
-        summary: "Reload this Page and wait for the selected navigation state.",
+        summary: "Reload this Page and wait for the selected navigation state. A reload that has not committed by the timeout is stopped so the Page stays usable on its previous document.",
         options: {
             timeout,
             waitUntil: option("string", "Completion state; defaults to load. networkidle requires 500ms without network activity.", ["commit", "domcontentloaded", "load", "networkidle"]),
@@ -7820,6 +7832,11 @@ function installStaleEgoBrowserGuard(target) {
 }
 
 const RESPONSE_TIMEOUT_MS = 15000;
+// Page.enable, Network.enable, and Target.setAutoAttach answer within
+// milliseconds on a responsive Page. A Page whose main-frame navigation has
+// started but not committed, or whose renderer hangs, answers none of them
+// until it recovers, so one caller never waits longer than this for setup.
+const SESSION_SETUP_WAIT_MS = 2000;
 const SESSION_TTL_MS = 2000;
 // Upper bound for buffered CDP events. The runtime can be long-lived (installEgoSdk
 // inside the browser); without a cap, undrained events grow without bound.
@@ -7831,13 +7848,11 @@ const OOPIF_AUTO_ATTACH_PARAMS = {
     autoAttach: true,
     waitForDebuggerOnStart: true,
     flatten: true,
-    // Ego Lite can pause an excluded dedicated worker without attaching it,
-    // leaving no session through which the harness can resume that worker.
-    filter: [
-        { type: "iframe", exclude: false },
-        { type: "worker", exclude: false },
-        { exclude: true },
-    ],
+    // Ego Lite can pause an excluded related target (dedicated worker,
+    // AudioWorklet, ...) without attaching it, leaving no session through which
+    // the harness can resume it. Attach every type; the attach handler resumes
+    // and detaches everything except iframes.
+    filter: [{}],
 };
 // A modal JavaScript dialog stalls every command the renderer has to answer,
 // including Page.getFrameTree, Page.captureScreenshot, DOM.*, Accessibility.*,
@@ -7873,6 +7888,36 @@ class CdpRequestTimeoutError extends Error {
         this.timeoutMs = timeoutMs;
         this.sessionId = sessionId;
     }
+}
+/**
+ * The Page's renderer did not answer a command it has to answer itself.
+ * Chromium suspends every renderer-bound command while a main-frame navigation
+ * has started but not committed; a hung renderer behaves the same way. It is
+ * still a request timeout, so budget-driven retry loops that treat a timeout
+ * at their deadline as their own timeout keep doing so.
+ */
+class PageUnresponsiveError extends CdpRequestTimeoutError {
+    code = "EGO_PAGE_UNRESPONSIVE";
+    waitedMs;
+    targetId;
+    /**
+     * The pending navigation was stopped once the wait ran out and the Page
+     * answers again; `currentUrl` is what its main frame showed afterwards.
+     */
+    stopped = false;
+    currentUrl;
+    constructor(method, waitedMs, targetId, sessionId) {
+        super(method, waitedMs, sessionId);
+        this.name = "PageUnresponsiveError";
+        this.message = `Page did not answer ${method} within ${waitedMs}ms; its main-frame navigation has not committed or its renderer is unresponsive`;
+        this.waitedMs = waitedMs;
+        this.targetId = targetId;
+    }
+}
+function isPageUnresponsiveError(error) {
+    return (error instanceof PageUnresponsiveError ||
+        (error instanceof Error &&
+            error.code === "EGO_PAGE_UNRESPONSIVE"));
 }
 function isCdpRequestTimeoutError(error) {
     return (error instanceof CdpRequestTimeoutError ||
@@ -7936,7 +7981,9 @@ function targetState(targetId) {
             sessionAt: 0,
             sessionInflight: null,
             events: [],
+            egoAutomationEnabled: false,
             pageEventsEnabled: false,
+            pageEnableInflight: null,
             networkDomainEnabled: false,
             networkEnableInflight: null,
             autoAttachEnabled: false,
@@ -7963,7 +8010,9 @@ function registerSession(targetId, sessionId) {
     }
     target.sessionId = sessionId;
     target.sessionAt = Date.now();
+    target.egoAutomationEnabled = false;
     target.pageEventsEnabled = false;
+    target.pageEnableInflight = null;
     target.networkDomainEnabled = false;
     target.networkEnableInflight = null;
     target.autoAttachEnabled = false;
@@ -8063,7 +8112,9 @@ function clearTargetSession(targetId, { remove = false } = {}) {
     target.sessionAt = 0;
     target.sessionInflight = null;
     target.events.length = 0;
+    target.egoAutomationEnabled = false;
     target.pageEventsEnabled = false;
+    target.pageEnableInflight = null;
     target.networkDomainEnabled = false;
     target.networkEnableInflight = null;
     target.autoAttachEnabled = false;
@@ -8265,6 +8316,7 @@ function recordCommandState(method, params, sessionId, response) {
         const attachedSessionId = response.result?.sessionId || response.sessionId;
         if (params?.targetId && attachedSessionId) {
             registerSession(params.targetId, attachedSessionId);
+            enableEgoAutomation(attachedSessionId);
         }
         return;
     }
@@ -8301,11 +8353,15 @@ function recordCommandState(method, params, sessionId, response) {
 async function ensureSession(requestedTargetId = undefined, timeoutMs = RESPONSE_TIMEOUT_MS) {
     const cachedTargetId = requestedTargetId || state.preferredTargetId || defaultTargetId;
     const cached = cachedTargetId ? targetStates.get(cachedTargetId) : undefined;
+    // Session setup is best-effort and shared: an unanswered request keeps
+    // running for later callers, while this caller's wait stays short so that
+    // the command it actually came for gets the rest of its budget.
+    const setupWaitMs = Math.min(Math.max(1, timeoutMs), SESSION_SETUP_WAIT_MS);
     if (cached?.sessionId && Date.now() - cached.sessionAt < SESSION_TTL_MS) {
         await Promise.all([
-            enablePageEvents(cached.sessionId, timeoutMs),
-            enableNetworkTrackingForSession(cached.sessionId, false, timeoutMs),
-            enableOopifAutoAttach(cached.sessionId, timeoutMs),
+            enablePageEvents(cached.sessionId, setupWaitMs),
+            enableNetworkTrackingForSession(cached.sessionId, false, setupWaitMs),
+            enableOopifAutoAttach(cached.sessionId, setupWaitMs),
         ]);
         cached.sessionAt = Date.now();
         return cached.sessionId;
@@ -8338,10 +8394,11 @@ async function ensureSession(requestedTargetId = undefined, timeoutMs = RESPONSE
                 }
                 registerSession(targetId, sessionId);
             }
+            enableEgoAutomation(target.sessionId);
             await Promise.all([
-                enablePageEvents(target.sessionId, timeoutMs),
-                enableNetworkTrackingForSession(target.sessionId, false, timeoutMs),
-                enableOopifAutoAttach(target.sessionId, timeoutMs),
+                enablePageEvents(target.sessionId, setupWaitMs),
+                enableNetworkTrackingForSession(target.sessionId, false, setupWaitMs),
+                enableOopifAutoAttach(target.sessionId, setupWaitMs),
             ]);
             target.sessionAt = Date.now();
             return target.sessionId;
@@ -8362,13 +8419,28 @@ async function ensureFrameSessions(pageTargetId, timeoutMs = RESPONSE_TIMEOUT_MS
     if (typeof pageTargetId !== "string" || pageTargetId.length === 0) {
         throw new TypeError("ensureFrameSessions requires a non-empty targetId");
     }
-    const deadline = state.now() + Math.max(1, timeoutMs);
+    const startedAt = state.now();
+    const deadline = startedAt + Math.max(1, timeoutMs);
     const remaining = () => Math.max(1, deadline - state.now());
     const pageSessionId = await ensureSession(pageTargetId, remaining());
-    const [response, frameTreeResponse] = await Promise.all([
-        browserCdp("Target.getTargets", {}, undefined, remaining()),
-        browserCdp("Page.getFrameTree", {}, pageSessionId, remaining()),
-    ]);
+    let response;
+    let frameTreeResponse;
+    try {
+        [response, frameTreeResponse] = await Promise.all([
+            browserCdp("Target.getTargets", {}, undefined, remaining()),
+            browserCdp("Page.getFrameTree", {}, pageSessionId, remaining()),
+        ]);
+    }
+    catch (error) {
+        // The browser process answers Target.getTargets on its own, so a frame
+        // tree timeout means the Page's renderer did not answer within the budget
+        // this call had left: name that instead of the last command sent.
+        if (isCdpRequestTimeoutError(error) &&
+            error.method === "Page.getFrameTree") {
+            throw new PageUnresponsiveError("Page.getFrameTree", state.now() - startedAt, pageTargetId, pageSessionId);
+        }
+        throw error;
+    }
     const targetInfos = response?.result?.targetInfos || response?.targetInfos || [];
     const frameTree = frameTreeResponse?.result?.frameTree || frameTreeResponse?.frameTree;
     const frameParents = new Map();
@@ -8575,6 +8647,8 @@ function networkActivity(sessionIds) {
     let tracking = sessionIds.length > 0;
     let inflight = 0;
     let lastActivityAt = 0;
+    const pendingRequests = [];
+    const counted = new Set();
     for (const sessionId of new Set(sessionIds)) {
         const targetId = sessionTargets.get(sessionId);
         const target = targetId ? targetStates.get(targetId) : undefined;
@@ -8584,10 +8658,24 @@ function networkActivity(sessionIds) {
             tracking = false;
             continue;
         }
-        inflight += target.inflightNetworkRequests.size;
-        lastActivityAt = Math.max(lastActivityAt, target.lastNetworkActivityAt);
+        // A request migrates to a child frame target the moment that target
+        // attaches, which can precede the caller's next frame enumeration. Count
+        // the whole subtree so migration never hides an in-flight request.
+        for (const treeTargetId of pageTreeTargetIds(targetId)) {
+            if (counted.has(treeTargetId))
+                continue;
+            counted.add(treeTargetId);
+            const member = targetStates.get(treeTargetId);
+            if (!member)
+                continue;
+            inflight += member.inflightNetworkRequests.size;
+            lastActivityAt = Math.max(lastActivityAt, member.lastNetworkActivityAt);
+            for (const request of member.inflightNetworkRequests.values()) {
+                pendingRequests.push(`${request.type || "Other"} ${request.url || request.requestId}`);
+            }
+        }
     }
-    return { tracking, inflight, lastActivityAt };
+    return { tracking, inflight, lastActivityAt, pendingRequests };
 }
 /** Refresh and return the main and known OOPIF sessions for one Page. */
 async function pageNetworkSessions(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
@@ -8683,19 +8771,40 @@ function prepareFileChooser(sessionId, { timeoutMs, cancel }) {
     });
     return interception;
 }
+/**
+ * Turn on Ego Lite's automation hooks for one renderer session. They keep the
+ * session's Runtime domain from reporting console messages and capturing call
+ * stacks, both of which pages can observe to detect CDP automation. The
+ * browser keeps the flag across renderer swaps, so it is sent once per session
+ * and before anything else, without waiting: older browsers reject the unknown
+ * domain, and a renderer stalled by a dialog must not block attachment.
+ */
+function enableEgoAutomation(sessionId) {
+    const targetId = sessionId ? sessionTargets.get(sessionId) : undefined;
+    const target = targetId ? targetStates.get(targetId) : undefined;
+    if (!target ||
+        target.sessionId !== sessionId ||
+        target.egoAutomationEnabled) {
+        return;
+    }
+    target.egoAutomationEnabled = true;
+    void rawCdp("egoAutomated.enable", {}, sessionId).catch(() => { });
+}
 async function enablePageEvents(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
     const targetId = sessionId ? sessionTargets.get(sessionId) : undefined;
     const target = targetId ? targetStates.get(targetId) : undefined;
-    if (!target || target.pageEventsEnabled) {
+    if (!target || target.sessionId !== sessionId || target.pageEventsEnabled) {
         return;
     }
     try {
-        await rawCdp("Page.enable", {}, sessionId, timeoutMs);
-        target.pageEventsEnabled = true;
+        await sharedSetupCommand(target, "pageEnableInflight", "Page.enable", {}, sessionId, timeoutMs, () => {
+            target.pageEventsEnabled = true;
+        });
     }
     catch {
         // Dialog tracking is best-effort. Do not make all helpers fail on targets
-        // that reject Page.enable, such as unusual internal pages.
+        // that reject Page.enable, such as unusual internal pages, or that cannot
+        // answer yet because a navigation has not committed.
     }
 }
 async function enableNetworkTrackingForSession(sessionId, required = false, timeoutMs = RESPONSE_TIMEOUT_MS) {
@@ -8709,33 +8818,17 @@ async function enableNetworkTrackingForSession(sessionId, required = false, time
     }
     if (target.networkDomainEnabled)
         return;
-    let inflight = target.networkEnableInflight;
-    const reusedInflight = Boolean(inflight);
-    if (!inflight) {
-        inflight = rawCdp("Network.enable", {}, sessionId, timeoutMs).then(() => {
-            // Events and an OOPIF request migration can race ahead of this response.
-            // Network.disable and session replacement already clear stale state, so
-            // enabling must preserve everything observed for the current session.
-            if (target.sessionId === sessionId && !target.networkDomainEnabled) {
+    try {
+        await sharedSetupCommand(target, "networkEnableInflight", "Network.enable", {}, sessionId, timeoutMs, () => {
+            // Events and an OOPIF request migration can race ahead of this
+            // response. Network.disable and session replacement already clear
+            // stale state, so enabling must preserve everything observed for the
+            // current session.
+            if (!target.networkDomainEnabled) {
                 target.lastNetworkActivityAt = state.now();
                 target.networkDomainEnabled = true;
             }
         });
-        target.networkEnableInflight = inflight;
-        void inflight.then(() => {
-            if (target.networkEnableInflight === inflight) {
-                target.networkEnableInflight = null;
-            }
-        }, () => {
-            if (target.networkEnableInflight === inflight) {
-                target.networkEnableInflight = null;
-            }
-        });
-    }
-    try {
-        await (reusedInflight
-            ? waitForSharedCdpRequest(inflight, "Network.enable", sessionId, timeoutMs)
-            : inflight);
     }
     catch (error) {
         if (required)
@@ -8751,40 +8844,53 @@ async function enableOopifAutoAttach(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS)
     if (!target || target.sessionId !== sessionId || target.autoAttachEnabled) {
         return;
     }
-    let inflight = target.autoAttachInflight;
-    const reusedInflight = Boolean(inflight);
-    if (!inflight) {
-        inflight = rawCdp("Target.setAutoAttach", OOPIF_AUTO_ATTACH_PARAMS, sessionId, timeoutMs).then(() => {
-            if (target.sessionId === sessionId)
-                target.autoAttachEnabled = true;
-        });
-        target.autoAttachInflight = inflight;
-        void inflight.then(() => {
-            if (target.autoAttachInflight === inflight) {
-                target.autoAttachInflight = null;
-            }
-        }, () => {
-            if (target.autoAttachInflight === inflight) {
-                target.autoAttachInflight = null;
-            }
-        });
-    }
     try {
-        await (reusedInflight
-            ? waitForSharedCdpRequest(inflight, "Target.setAutoAttach", sessionId, timeoutMs)
-            : inflight);
+        await sharedSetupCommand(target, "autoAttachInflight", "Target.setAutoAttach", OOPIF_AUTO_ATTACH_PARAMS, sessionId, timeoutMs, () => {
+            target.autoAttachEnabled = true;
+        });
     }
     catch {
         // Page APIs still work on bridges without auto-attach. Frame discovery can
         // attach explicitly later, but exact network-idle tracking needs support.
     }
 }
+/**
+ * Send one session-setup command at most once at a time per session, and
+ * bound this caller's wait without cancelling the request. The request keeps
+ * the full transport timeout, so a Page that answers late (after its pending
+ * navigation commits) still records the enabled state for later callers
+ * instead of each caller sending the command again and waiting again.
+ */
+function sharedSetupCommand(target, key, method, params, sessionId, timeoutMs, onSuccess) {
+    let inflight = target[key];
+    if (!inflight) {
+        inflight = rawCdp(method, params, sessionId).then(() => {
+            if (target.sessionId === sessionId)
+                onSuccess();
+        });
+        target[key] = inflight;
+        const clear = () => {
+            if (target[key] === inflight)
+                target[key] = null;
+        };
+        void inflight.then(clear, clear);
+    }
+    return waitForSharedCdpRequest(inflight, method, sessionId, timeoutMs);
+}
 /** Bound one caller's wait without cancelling the shared CDP request. */
 function waitForSharedCdpRequest(request, method, sessionId, timeoutMs) {
     const callerTimeoutMs = Math.max(1, timeoutMs);
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-            reject(new CdpRequestTimeoutError(method, callerTimeoutMs, sessionId));
+            // Mirror rawCdp's timeout: name a dialog if one is what stalled it.
+            const dialog = DIALOG_SAFE_METHOD(method)
+                ? null
+                : pendingDialog(sessionId);
+            reject(dialog
+                ? new PageDialogOpenedError(method, sessionId, dialog, {
+                    alreadyOpen: true,
+                })
+                : new CdpRequestTimeoutError(method, callerTimeoutMs, sessionId));
         }, callerTimeoutMs);
         request.then(() => {
             clearTimeout(timer);
@@ -8799,6 +8905,8 @@ function initializeAutoAttachedTarget(sessionId, waitingForDebugger) {
     // Invoke every initializer before awaiting any result. Chromium can pause an
     // OOPIF at attachment, so waiting for Network.enable before sending resume
     // would deadlock if the protocol response depends on renderer progress.
+    // Automation hooks go first so they cover the frame's first script.
+    enableEgoAutomation(sessionId);
     const pageEvents = enablePageEvents(sessionId);
     const networkEvents = enableNetworkTrackingForSession(sessionId);
     const nestedFrames = enableOopifAutoAttach(sessionId);
@@ -8806,6 +8914,22 @@ function initializeAutoAttachedTarget(sessionId, waitingForDebugger) {
         ? rawCdp("Runtime.runIfWaitingForDebugger", {}, sessionId).catch(() => { })
         : Promise.resolve();
     void Promise.allSettled([pageEvents, networkEvents, nestedFrames, resume]);
+}
+/**
+ * Resume a non-frame target (worker, worklet, ...) paused by auto-attach and
+ * drop its session, so the harness never holds a debugger on targets it does
+ * not drive.
+ */
+function releaseAutoAttachedTarget(sessionId, parentSessionId, waitingForDebugger) {
+    // Detach is answered by the browser and could overtake a resume still on its
+    // way to the renderer, so only detach after the resume has been answered.
+    const resume = waitingForDebugger
+        ? rawCdp("Runtime.runIfWaitingForDebugger", {}, sessionId)
+        : Promise.resolve();
+    void resume
+        .catch(() => { })
+        .then(() => rawCdp("Target.detachFromTarget", { sessionId }, parentSessionId))
+        .catch(() => { });
 }
 function finishNetworkRequest(targetId, requestId) {
     const now = state.now();
@@ -8868,6 +8992,7 @@ function recordNetworkEvent(targetId, target, data) {
             ...(typeof data.params?.type === "string"
                 ? { type: data.params.type }
                 : {}),
+            ...(typeof url === "string" ? { url } : {}),
         });
         target.lastNetworkActivityAt = state.now();
         return;
@@ -9021,9 +9146,14 @@ function handleMessage(message) {
         if (sessionId && targetType === "iframe") {
             initializeAutoAttachedTarget(sessionId, data.params?.waitingForDebugger === true);
         }
+        else if (sessionId && sourceTargetId && targetType !== "page") {
+            // Auto-attached by one of this runtime's sessions: a worker, worklet, or
+            // other related target the harness does not drive.
+            releaseAutoAttachedTarget(sessionId, data.sessionId, data.params?.waitingForDebugger === true);
+        }
         else if (sessionId && data.params?.waitingForDebugger === true) {
             // A foreign auto-attach configuration may still deliver other related
-            // target types. Never leave an unrelated worker paused by this runtime.
+            // target types. Never leave an unrelated target paused by this runtime.
             void rawCdp("Runtime.runIfWaitingForDebugger", {}, sessionId).catch(() => { });
         }
     }
@@ -9543,6 +9673,14 @@ const SCROLL_TARGET_FUNCTIONS = `
 /** Browser-side scroll targeting shared by candidate selection and actions. */
 const SCROLL_TARGET_HELPERS = `
   ${COMPOSED_PARENT_HELPER}
+  ${SCROLL_TARGET_FUNCTIONS}
+`;
+/**
+ * Scroll targeting plus the enabled check, for a forced click that skips the
+ * hit test but still refuses a disabled element.
+ */
+const ENABLED_SCROLL_TARGET_HELPERS = `
+  ${ACTION_TARGET_STATE_HELPERS}
   ${SCROLL_TARGET_FUNCTIONS}
 `;
 /** Editing semantics layered on top of the shared composed-tree traversal. */
@@ -11115,6 +11253,22 @@ function buildCssCountJs(selector) {
             return __egoQueryAllOpenShadow(${JSON.stringify(selector)}).length;
           })()`;
 }
+/**
+ * True for a plain CSS selector: not a `@ref` and not a `loc=` / role / href
+ * locator. A malformed locator is reported by the caller's resolver path.
+ */
+function isRawSelector(input) {
+    if (typeof input !== "string" || input.trim().length === 0)
+        return false;
+    if (parseRef(input))
+        return false;
+    try {
+        return parseLocatorOrThrow(input) === null;
+    }
+    catch {
+        return false;
+    }
+}
 function buildSelectorCenterJs(selector) {
     const findExpr = buildFindElementJs(selector);
     return `(() => {
@@ -11900,10 +12054,34 @@ async function elementCenter(selectorOrRef) {
     await ensureRefMapForRef(selectorOrRef);
     return resolveElementCenter({ sendRaw: cdp }, undefined, browserRefMap, selectorOrRef);
 }
-// Sequence number for default screenshot file names. Combined with the pid it
-// keeps concurrent agent processes (parallel task spaces) from overwriting each
-// other's shots in the shared tmpdir, and successive shots in one run distinct.
-let screenshotSeq = 0;
+/**
+ * Directory and name for a screenshot taken without an explicit path.
+ *
+ * The embedded host runs every script in one long-lived Node process, giving
+ * each run its own `globalThis` but sharing `process.env`, `os.tmpdir()` and
+ * the pid. A host that needs per-run output sets
+ * `globalThis.EGO_BROWSER_OUTPUT_DIR` to an absolute directory; a random
+ * six-digit suffix keeps concurrent runs in the shared default directory from
+ * overwriting each other while staying short enough to read back easily.
+ */
+function defaultScreenshotPath() {
+    const outputDir = globalThis
+        .EGO_BROWSER_OUTPUT_DIR;
+    let directory = tmpdir();
+    if (outputDir !== undefined) {
+        // Same rule as an explicit screenshot path: the Node context does not run
+        // in the caller's working directory, so a relative directory would land
+        // somewhere unexpected (or fail with EPERM on Windows).
+        if (typeof outputDir !== "string" ||
+            outputDir.length === 0 ||
+            !isAbsolute(outputDir)) {
+            throw new TypeError("globalThis.EGO_BROWSER_OUTPUT_DIR must be an absolute directory path");
+        }
+        directory = outputDir;
+    }
+    const suffix = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    return join(directory, `ego-browser-shot-${suffix}.png`);
+}
 async function captureScreenshot(path, options = {}) {
     assertScreenshotScale(options.scale);
     const sessionId = isBrowserRuntime() ? await ensureSession() : undefined;
@@ -11915,8 +12093,7 @@ async function captureScreenshot(path, options = {}) {
  */
 async function captureScreenshotForSession(path, options = {}, sessionId) {
     assertScreenshotScale(options.scale);
-    const outputPath = path ??
-        join(tmpdir(), `ego-browser-shot-${process.pid}-${++screenshotSeq}.png`);
+    const outputPath = path ?? defaultScreenshotPath();
     const full = options.full ?? false;
     // CSS-pixel sizing is the default and the only declarative scale mode. Keep
     // the legacy raw flag as an internal compatibility escape hatch.
@@ -12048,8 +12225,14 @@ async function resolveAndCall(selectorOrRef, functionDeclaration, args = []) {
     });
 }
 
-const INPUT_EVENT_DELAY_MS$2 = 25;
+// Native mouse events are delivered in order by the renderer, so a click needs
+// no pause between move, press, and release. Explicit `delayMs` options and
+// the pointer-driven drags keep their caller-chosen pauses.
+const INPUT_EVENT_DELAY_MS$2 = 0;
 const INPUT_DISPATCH_TIMEOUT_MS$1 = 1000;
+// A click probe is only read back after a dispatch timeout; an acknowledged
+// click leaves it to remove itself.
+const CLICK_PROBE_TTL_MS = 5_000;
 /**
  * Mouse target accepted by mouse helpers.
  *
@@ -12069,13 +12252,11 @@ const INPUT_DISPATCH_TIMEOUT_MS$1 = 1000;
  * @returns {Promise<void>}
  */
 async function click(target, options = {}) {
-    const point = await resolveMouseTarget(target);
+    const { probeId, ...point } = await resolveClickTarget(target);
     const button = options.button || "left";
     const buttons = pressedButtons$1(button);
     const clickCount = options.clickCount ?? options.clicks ?? 1;
     maybeHighlight(point, options.label);
-    const probeId = await installClickProbe(point);
-    let dispatchError = null;
     try {
         await dispatchMouse(point, "mouseMoved", {
             button: "none",
@@ -12097,11 +12278,15 @@ async function click(target, options = {}) {
     catch (error) {
         if (!isInputDispatchTimeout(error))
             throw error;
-        dispatchError = error;
+        // The renderer did not acknowledge the input in time (typically an
+        // occluded window). A timeout does not prove the event was dropped, so
+        // the probe installed before dispatch decides: a trusted click that
+        // already reached the target counts as delivered; otherwise synthetic
+        // mouse events go to the element under the point.
+        const completed = await finishClickProbe(point, probeId, clickCount);
+        if (!completed)
+            throw error;
     }
-    const completed = await finishClickProbe(point, probeId, clickCount);
-    if (dispatchError && !completed)
-        throw dispatchError;
 }
 /**
  * Double-click a mouse target.
@@ -12131,7 +12316,7 @@ async function hover(target, options = {}) {
             throw error;
         dispatchError = error;
     }
-    const completed = await finishHoverProbe(point, probeId);
+    const completed = await finishHoverProbe(point, probeId, Boolean(dispatchError));
     if (dispatchError && !completed)
         throw dispatchError;
 }
@@ -12182,31 +12367,105 @@ async function dragMouse(points, options = {}) {
             throw error;
         dispatchError = error;
     }
-    const completed = await finishDragProbe(resolved, probeId, button);
+    const completed = await finishDragProbe(resolved, probeId, button, Boolean(dispatchError));
     if (dispatchError && !completed)
         throw dispatchError;
 }
 function inputEventDelay$1(ms = INPUT_EVENT_DELAY_MS$2) {
+    if (!(ms > 0))
+        return Promise.resolve();
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/**
+ * Resolve the click point and install the trusted-click probe before any
+ * input is dispatched. A plain CSS selector found in the default session does
+ * both in the one `Runtime.evaluate` that resolves it; refs, locators,
+ * offsets, coordinates, and a selector the fast path did not find resolve
+ * through the shared resolver first and install the probe in a call of their
+ * own rather than risk a replayed click. Without native bindings there is no
+ * fallback, so no probe is installed.
+ */
+async function resolveClickTarget(target) {
+    if (typeof target === "string" && canProbeInputFallback$1()) {
+        const point = await resolveRawSelectorClickTarget(target);
+        if (point)
+            return point;
+    }
+    const point = await resolveMouseTarget(target);
+    return { ...point, probeId: await installClickProbe(point) };
+}
+async function resolveRawSelectorClickTarget(selector) {
+    if (!isRawSelector(selector))
+        return null;
+    const id = newProbeId("click");
+    const expression = `(() => {
+    const center = ${buildSelectorCenterJs(selector)};
+    if (!center) return null;
+    ${clickProbeInstallJs(id, "center")}
+    return { x: center.x, y: center.y };
+  })()`;
+    const result = await cdp("Runtime.evaluate", {
+        expression,
+        returnByValue: true,
+        awaitPromise: false,
+    });
+    // No match in the default session, an invalid selector, or an unexpected
+    // value: hand the selector to the shared resolver, which searches the
+    // sessions it knows about and reports a missing element with its own
+    // wording. The probe was not installed in that case, so the generic path
+    // installs one after resolving.
+    if (result.exceptionDetails)
+        return null;
+    const value = result.result?.value;
+    if (typeof value?.x !== "number" || typeof value?.y !== "number") {
+        return null;
+    }
+    return { x: value.x, y: value.y, sessionId: undefined, probeId: id };
+}
+function newProbeId(kind) {
+    return `${kind}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+/**
+ * Page-side click probe: remembers the element under `pointExpression` and
+ * whether a trusted click reached it. The listener removes itself on the
+ * first matching click, and the whole probe removes itself after
+ * CLICK_PROBE_TTL_MS so an acknowledged click never has to read it back.
+ */
+function clickProbeInstallJs(id, pointExpression) {
+    return `
+    const probePoint = ${pointExpression};
+    window.__egoBrowserInputProbes ||= {};
+    const probe = { seen: false, target: document.elementFromPoint(probePoint.x, probePoint.y) };
+    probe.dispose = () => {
+      document.removeEventListener("click", probe.handler, true);
+      clearTimeout(probe.timer);
+    };
+    probe.handler = (event) => {
+      if (
+        event.isTrusted && probe.target &&
+        (event.target === probe.target || probe.target.contains(event.target))
+      ) {
+        probe.seen = true;
+        probe.dispose();
+      }
+    };
+    probe.timer = setTimeout(() => {
+      probe.dispose();
+      delete window.__egoBrowserInputProbes[${JSON.stringify(id)}];
+    }, ${JSON.stringify(CLICK_PROBE_TTL_MS)});
+    document.addEventListener("click", probe.handler, true);
+    window.__egoBrowserInputProbes[${JSON.stringify(id)}] = probe;
+  `;
 }
 async function installClickProbe(point) {
     if (!canProbeInputFallback$1())
         return null;
-    const id = `click_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const id = newProbeId("click");
     try {
         const result = await cdp("Runtime.evaluate", {
             expression: `(() => {
-        const target = document.elementFromPoint(${JSON.stringify(point.x)}, ${JSON.stringify(point.y)});
-        window.__egoBrowserInputProbes ||= {};
-        const probe = { seen: false, target };
-        probe.handler = (event) => {
-          if (event.isTrusted && target && (event.target === target || target.contains(event.target))) {
-            probe.seen = true;
-          }
-        };
-        document.addEventListener("click", probe.handler, true);
-        window.__egoBrowserInputProbes[${JSON.stringify(id)}] = probe;
-        return Boolean(target);
+        ${clickProbeInstallJs(id, JSON.stringify({ x: point.x, y: point.y }))}
+        return Boolean(probe.target);
       })()`,
             returnByValue: true,
             awaitPromise: false,
@@ -12220,6 +12479,8 @@ async function installClickProbe(point) {
 async function finishClickProbe(point, id, clickCount) {
     if (!id)
         return false;
+    // Give a trusted click that the renderer is still delivering a moment to
+    // land before the page is asked whether input arrived.
     await inputEventDelay$1(50);
     try {
         const result = await cdp("Runtime.evaluate", {
@@ -12227,7 +12488,7 @@ async function finishClickProbe(point, id, clickCount) {
         const probes = window.__egoBrowserInputProbes || {};
         const probe = probes[${JSON.stringify(id)}];
         if (!probe) return { seen: false, fallback: false };
-        document.removeEventListener("click", probe.handler, true);
+        probe.dispose();
         delete probes[${JSON.stringify(id)}];
         if (probe.seen || !probe.target) return { seen: probe.seen, fallback: false };
         const target = probe.target;
@@ -12315,10 +12576,11 @@ async function installHoverProbe(point) {
         return null;
     }
 }
-async function finishHoverProbe(point, id) {
+async function finishHoverProbe(point, id, settle) {
     if (!id)
         return false;
-    await inputEventDelay$1(50);
+    if (settle)
+        await inputEventDelay$1(50);
     try {
         const result = await cdp("Runtime.evaluate", {
             expression: `(() => {
@@ -12353,10 +12615,11 @@ async function finishHoverProbe(point, id) {
         return false;
     }
 }
-async function finishDragProbe(points, id, button) {
+async function finishDragProbe(points, id, button, settle) {
     if (!id)
         return false;
-    await inputEventDelay$1(50);
+    if (settle)
+        await inputEventDelay$1(50);
     const first = points[0];
     const last = points.at(-1);
     try {
@@ -14151,6 +14414,11 @@ const STEP_INTERVAL_MS = 8;
  * Dispatch one logical wheel action as a short eased browser-input motion.
  * Small deltas stay immediate, while page-sized deltas are spread over enough
  * input frames to remain visually continuous without creating a long gesture.
+ *
+ * Returns false when `exhausted()` cut the motion short. A page that handles
+ * each wheel event slowly (a map that zooms on wheel, a busy main thread) can
+ * make one motion take far longer than the action's deadline, so the caller's
+ * budget is checked before every event rather than only between motions.
  */
 async function dispatchWheelMotion(services, motion) {
     const distance = Math.max(Math.abs(motion.deltaX), Math.abs(motion.deltaY));
@@ -14160,6 +14428,8 @@ async function dispatchWheelMotion(services, motion) {
     let emittedX = 0;
     let emittedY = 0;
     for (let step = 1; step <= steps; step += 1) {
+        if (step > 1 && services.exhausted?.())
+            return false;
         const progress = step / steps;
         const eased = progress * progress * (3 - 2 * progress);
         const cumulativeX = step === steps ? motion.deltaX : motion.deltaX * eased;
@@ -14179,6 +14449,7 @@ async function dispatchWheelMotion(services, motion) {
         if (step < steps)
             await services.sleep(STEP_INTERVAL_MS);
     }
+    return true;
 }
 
 /** Select option values from one visible, enabled select element. */
@@ -14300,11 +14571,14 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
         actionability: options.force ? "enabled" : "pointer-enabled",
     });
     try {
+        // One page round trip computes the action point and verifies that the
+        // element is visible, enabled, and (unless forced) the hit target there.
         let point = await resolveElementPoint(services, target.sessionId, target.objectId, {
             position: options.position,
             frameId: target.frameId,
             actionName: "page.click",
             hitTest: !options.force,
+            requireEnabled: true,
             stability: "recompute",
             pageSessionId: sessionId,
             iframeSessions,
@@ -14326,10 +14600,7 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
             // press so native input uses the post-hover viewport coordinates.
             const pagePoint = await pagePointForFrame(services, target.sessionId, target.frameId, point.local, sessionId);
             point = { ...pagePoint, local: point.local };
-            await assertElementEnabled(services, target.sessionId, target.objectId, "page.click");
-            if (!options.force) {
-                await assertElementReceivesPointerEvents(services, target.sessionId, target.objectId, point.local);
-            }
+            await assertClickTargetActionable(services, target.sessionId, target.objectId, point.local, { hitTest: !options.force });
             await dispatchMouseEvent(services, target.sessionId, {
                 type: "mouseMoved",
                 x: point.x,
@@ -14341,15 +14612,13 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
         }
         for (let count = 1; count <= clickCount; count += 1) {
             // Moving the pointer or completing an earlier click can change layout.
-            // Recheck before every press so hover-created overlays fail closed.
-            // A same-process iframe must keep its native move/press sequence
-            // contiguous; its state was checked immediately before that gesture's
-            // final move.
+            // Recheck the enabled state and the hit target in one page call before
+            // every press so hover-created overlays fail closed. A same-process
+            // iframe must keep its native move/press sequence contiguous; its state
+            // was checked immediately before that gesture's final move, and later
+            // presses in any iframe only recheck the enabled state.
             if (!target.frameId || count > 1) {
-                await assertElementEnabled(services, target.sessionId, target.objectId, "page.click");
-            }
-            if (!options.force && !target.frameId) {
-                await assertElementReceivesPointerEvents(services, target.sessionId, target.objectId, point.local);
+                await assertClickTargetActionable(services, target.sessionId, target.objectId, point.local, { hitTest: !options.force && !target.frameId });
             }
             await dispatchMouseEvent(services, target.sessionId, {
                 type: "mousePressed",
@@ -14377,9 +14646,7 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
         }
     }
     finally {
-        await services
-            .cdp("Runtime.releaseObject", { objectId: target.objectId }, target.sessionId)
-            .catch(() => { });
+        await releaseObject$1(services, target.sessionId, target.objectId);
     }
 }
 /** Focus, replace, and notify an input-like element in one target session. */
@@ -14705,6 +14972,11 @@ async function verifyFillOutcome(services, sessionId, objectId, before, value, c
         }
         const outcome = classifyFillOutcome(before, value, String(result?.actual ?? ""), clearFirst, String(result?.type ?? ""));
         lastOutcome = outcome;
+        // An accepted value is final: a later application reformat is accepted
+        // too, so there is nothing to wait for. Only a rejected reading is
+        // re-read, because the control may still be propagating the input.
+        if (fillOutcomeAccepted(outcome))
+            return outcome;
         const reading = `${outcome}\u0000${String(result?.actual ?? "")}`;
         if (reading === prior) {
             consecutiveReads += 1;
@@ -15042,7 +15314,7 @@ async function scrollElementIntoView(services, sessionId, objectId, frameId, act
     });
 }
 async function resolveElementPoint(services, sessionId, objectId, options = {}) {
-    const { position, frameId, actionName = "page.click", hitTest = true, stability = "strict", pageSessionId = sessionId, iframeSessions = new Map(), } = options;
+    const { position, frameId, actionName = "page.click", hitTest = true, requireEnabled = false, stability = "strict", pageSessionId = sessionId, iframeSessions = new Map(), } = options;
     if (position !== undefined &&
         (!position ||
             typeof position !== "object" ||
@@ -15079,13 +15351,21 @@ async function resolveElementPoint(services, sessionId, objectId, options = {}) 
       return { error: "element is not stable" };
     }`
         : settleExpression;
+    const helpers = hitTest
+        ? HIT_TARGET_HELPERS
+        : requireEnabled
+            ? ENABLED_SCROLL_TARGET_HELPERS
+            : SCROLL_TARGET_HELPERS;
     const expression = `async function(${position ? "position" : ""}) {
-    ${hitTest ? HIT_TARGET_HELPERS : SCROLL_TARGET_HELPERS}
+    ${helpers}
     if (!this.isConnected) return { error: "element is not connected" };
     let rect = this.getBoundingClientRect();
     let point = ${pointExpression};
     if (rect.width <= 0 || rect.height <= 0 || !point) {
       return { error: "element is not visible" };
+    }
+    if (${requireEnabled ? "true" : "false"} && isActionTargetDisabled(this)) {
+      return { error: "element is disabled" };
     }
     const scroll = scrollRequestForPoint(this, point);
     if (scroll) return { scroll };
@@ -15102,46 +15382,107 @@ async function resolveElementPoint(services, sessionId, objectId, options = {}) 
     if (frameId) {
         await ensureFrameOwnerInView(services, pageSessionId, frameId, actionName, iframeSessions);
     }
-    for (let attempt = 0; attempt <= AUTO_SCROLL_ATTEMPTS; attempt += 1) {
-        const response = await services.cdp("Runtime.callFunctionOn", {
-            functionDeclaration: expression,
-            objectId,
-            arguments: position ? [{ value: position }] : [],
-            returnByValue: true,
-            awaitPromise: true,
-        }, sessionId);
-        const point = runtimeValue(response, expression);
-        if (typeof point?.error === "string") {
-            throw new ElementResolutionError(`${actionName} failed: ${point.error}`, "transient");
-        }
-        const scroll = point?.scroll;
-        if (scroll) {
-            if (attempt === AUTO_SCROLL_ATTEMPTS ||
-                !Number.isFinite(scroll.x) ||
-                !Number.isFinite(scroll.y) ||
-                !Number.isFinite(scroll.deltaX) ||
-                !Number.isFinite(scroll.deltaY)) {
-                throw new ElementResolutionError(`${actionName} failed: element is not visible in the viewport`, "transient");
-            }
+    const point = await bringIntoView(services, sessionId, objectId, {
+        actionName,
+        subject: "element",
+        evaluate: async () => {
+            const response = await services.cdp("Runtime.callFunctionOn", {
+                functionDeclaration: expression,
+                objectId,
+                arguments: position ? [{ value: position }] : [],
+                returnByValue: true,
+                awaitPromise: true,
+            }, sessionId);
+            return runtimeValue(response, expression);
+        },
+        wheel: async (scroll) => {
             const pageScrollPoint = await pagePointForFrame(services, sessionId, frameId, scroll, pageSessionId);
-            await dispatchWheelMotion({
-                dispatch: (params) => dispatchMouseEvent(services, sessionId, params),
-                sleep: services.sleep,
-            }, {
+            return dispatchWheelMotion(wheelMotionServices(services, sessionId), {
                 x: pageScrollPoint.x,
                 y: pageScrollPoint.y,
                 deltaX: scroll.deltaX,
                 deltaY: scroll.deltaY,
             });
+        },
+    });
+    if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
+        throw new Error(`${actionName} could not resolve the element position`);
+    }
+    const pagePoint = await pagePointForFrame(services, sessionId, frameId, point, pageSessionId);
+    return { ...pagePoint, local: point };
+}
+function wheelMotionServices(services, sessionId) {
+    return {
+        dispatch: (params) => dispatchMouseEvent(services, sessionId, params),
+        sleep: services.sleep,
+        exhausted: () => actionDeadlinePassed(services),
+    };
+}
+function actionDeadlinePassed(services) {
+    return (services.actionDeadline !== undefined &&
+        services.now !== undefined &&
+        services.now() >= services.actionDeadline);
+}
+function sameWheelRequest(a, b) {
+    return (Math.abs(a.x - b.x) < 1 &&
+        Math.abs(a.y - b.y) < 1 &&
+        Math.abs(a.deltaX - b.deltaX) < 1 &&
+        Math.abs(a.deltaY - b.deltaY) < 1);
+}
+/**
+ * Re-evaluate a target until it reports a position instead of a scroll
+ * request, scrolling with browser wheel input in between.
+ *
+ * Wheel input is the primary path because it is trusted input that reaches
+ * the nearest scrollable container like a user's wheel would. It can fail
+ * silently: the wheel point may land on an element that calls
+ * `preventDefault()` on wheel events (maps, carousels, canvas editors), or
+ * the page may be at the end of its scroll range. When a motion leaves the
+ * target exactly where it was, the next request is identical, and the loop
+ * falls back once to `DOM.scrollIntoViewIfNeeded` (which bypasses a site's
+ * patched `Element.prototype.scrollIntoView`) instead of repeating a motion
+ * that already proved ineffective. The action deadline is checked before
+ * every motion and inside it so a slow wheel handler cannot run the action
+ * far past its timeout.
+ */
+async function bringIntoView(services, sessionId, objectId, input) {
+    const notVisible = () => new ElementResolutionError(`${input.actionName} failed: ${input.subject} is not visible in the viewport`, "transient");
+    let previous;
+    let fellBack = false;
+    for (let attempt = 0; attempt <= AUTO_SCROLL_ATTEMPTS; attempt += 1) {
+        const result = await input.evaluate();
+        if (typeof result?.error === "string") {
+            throw new ElementResolutionError(`${input.actionName} failed: ${result.error}`, "transient");
+        }
+        const scroll = result?.scroll;
+        if (!scroll)
+            return result;
+        if (attempt === AUTO_SCROLL_ATTEMPTS ||
+            !Number.isFinite(scroll.x) ||
+            !Number.isFinite(scroll.y) ||
+            !Number.isFinite(scroll.deltaX) ||
+            !Number.isFinite(scroll.deltaY) ||
+            actionDeadlinePassed(services)) {
+            throw notVisible();
+        }
+        if (previous && sameWheelRequest(previous, scroll)) {
+            if (fellBack)
+                throw notVisible();
+            fellBack = true;
+            previous = undefined;
+            try {
+                await services.cdp("DOM.scrollIntoViewIfNeeded", { objectId }, sessionId);
+            }
+            catch {
+                throw notVisible();
+            }
             continue;
         }
-        if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
-            throw new Error(`${actionName} could not resolve the element position`);
-        }
-        const pagePoint = await pagePointForFrame(services, sessionId, frameId, point, pageSessionId);
-        return { ...pagePoint, local: point };
+        previous = scroll;
+        if (!(await input.wheel(scroll)))
+            throw notVisible();
     }
-    throw new ElementResolutionError(`${actionName} failed: element is not visible in the viewport`, "transient");
+    throw notVisible();
 }
 async function ensureFrameOwnerInView(services, pageSessionId, frameId, actionName, iframeSessions, visited = new Set()) {
     if (visited.has(frameId))
@@ -15177,32 +15518,20 @@ async function ensureFrameOwnerInView(services, pageSessionId, frameId, actionNa
     return { scroll: scrollRequestForPoint(this, point) };
   }`;
     try {
-        for (let attempt = 0; attempt <= AUTO_SCROLL_ATTEMPTS; attempt += 1) {
-            const response = await services.cdp("Runtime.callFunctionOn", {
-                functionDeclaration: source,
-                objectId,
-                returnByValue: true,
-                awaitPromise: false,
-            }, ownerSessionId);
-            const result = runtimeValue(response, source);
-            if (typeof result?.error === "string") {
-                throw new ElementResolutionError(`${actionName} failed: ${result.error}`, "transient");
-            }
-            const scroll = result?.scroll;
-            if (!scroll)
-                return;
-            if (attempt === AUTO_SCROLL_ATTEMPTS ||
-                !Number.isFinite(scroll.x) ||
-                !Number.isFinite(scroll.y) ||
-                !Number.isFinite(scroll.deltaX) ||
-                !Number.isFinite(scroll.deltaY)) {
-                throw new ElementResolutionError(`${actionName} failed: iframe is not visible in the viewport`, "transient");
-            }
-            await dispatchWheelMotion({
-                dispatch: (params) => dispatchMouseEvent(services, ownerSessionId, params),
-                sleep: services.sleep,
-            }, scroll);
-        }
+        await bringIntoView(services, ownerSessionId, objectId, {
+            actionName,
+            subject: "iframe",
+            evaluate: async () => {
+                const response = await services.cdp("Runtime.callFunctionOn", {
+                    functionDeclaration: source,
+                    objectId,
+                    returnByValue: true,
+                    awaitPromise: false,
+                }, ownerSessionId);
+                return runtimeValue(response, source);
+            },
+            wheel: (scroll) => dispatchWheelMotion(wheelMotionServices(services, ownerSessionId), scroll),
+        });
     }
     finally {
         await releaseObject$1(services, ownerSessionId, objectId);
@@ -15280,6 +15609,39 @@ async function cursorPointForElement(services, pageSessionId, targetSessionId, f
     }
     catch {
         return inputPoint;
+    }
+}
+/**
+ * Re-validate a click target after the pointer moved, in one page round trip:
+ * the element must still be connected and enabled and, when `hitTest` is set,
+ * nothing may intercept pointer events at the frame-local `point`. Failures
+ * keep the resolver's wording and order (disabled before intercepted) so the
+ * retry loop and callers see the same transient errors as before.
+ */
+async function assertClickTargetActionable(services, sessionId, objectId, point, options) {
+    const { hitTest, actionName = "page.click" } = options;
+    const expression = `function clickTargetActionable(point) {
+    ${hitTest ? HIT_TARGET_HELPERS : ACTION_TARGET_STATE_HELPERS}
+    if (!this.isConnected) return { error: "element is not connected" };
+    if (isActionTargetDisabled(this)) return { error: "element is disabled" };
+    if (${hitTest ? "true" : "false"}) {
+      const interceptor = interceptingElementAtPoint(this, point);
+      if (interceptor) {
+        return { error: describeHitTarget(interceptor) + " intercepts pointer events" };
+      }
+    }
+    return { ok: true };
+  }`;
+    const response = await services.cdp("Runtime.callFunctionOn", {
+        functionDeclaration: expression,
+        objectId,
+        arguments: [{ value: point }],
+        returnByValue: true,
+        awaitPromise: false,
+    }, sessionId);
+    const result = runtimeValue(response, expression);
+    if (typeof result?.error === "string") {
+        throw new ElementResolutionError(`${actionName} failed: ${result.error}`, "transient");
     }
 }
 async function assertElementReceivesPointerEvents(services, sessionId, objectId, point) {
@@ -15391,7 +15753,11 @@ function showAgentActionLabel(services, label) {
     }
 }
 async function releaseObject$1(services, sessionId, objectId) {
-    await services
+    // Best-effort and not awaited: the action already finished with the handle.
+    // When the action started a navigation, the Page answers nothing until the
+    // new document commits, and waiting here would add a transport timeout to
+    // every click on a link.
+    void services
         .cdp("Runtime.releaseObject", { objectId }, sessionId)
         .catch(() => { });
 }
@@ -15495,23 +15861,51 @@ async function releaseObject(services, sessionId, objectId) {
         .catch(() => { });
 }
 
-const artifactDirectories = new Set();
+// Chromium keeps one download behavior per BrowserContext, and every ego lite
+// TaskSpace shares one context, so Page.setDownloadBehavior from any Page, in
+// any ego-browser process, overrides the others: the most recent call wins
+// and "default" from one Page strips the directory from everyone. Downloads
+// therefore all use the same directory with Chromium's `allowAndName`
+// behavior, which names each file after its download guid. Re-applying the
+// identical setting is harmless, and a waiter finds its own file by guid no
+// matter which Page armed last. The behavior goes back to default only when
+// no process on this machine still waits for a download.
+const WAITERS_DIRECTORY = "waiters";
+const STALE_WAITER_MS = 60 * 60 * 1_000;
+const WAITER_REFRESH_MS = 10 * 60 * 1_000;
+const STALE_FILE_MS = 24 * 60 * 60 * 1_000;
+const FILE_POLL_INTERVAL_MS = 50;
+let sharedDirectory;
+let waiterRefreshTimer;
+const ownedFiles = new Set();
+const armedInterceptions = new Set();
 const activeInterceptions = new Set();
 const activeDownloadTargets = new Set();
 /**
- * Arm one Page session for its next download without changing the shared
- * Chromium BrowserContext download behavior.
+ * The directory every ego-browser process on this machine downloads into.
+ * Files are named after their Chromium download guid.
+ */
+function downloadDirectory() {
+    if (sharedDirectory)
+        return sharedDirectory;
+    const directory = join(runtimeStateDir(), "downloads");
+    mkdirSync(join(directory, WAITERS_DIRECTORY), { recursive: true });
+    removeStaleFiles(directory);
+    sharedDirectory = directory;
+    return directory;
+}
+/**
+ * Arm one Page session for its next download.
  */
 function preparePageDownload(services, targetId, { timeoutMs }) {
     if (activeDownloadTargets.has(targetId)) {
         throw new Error(`${targetId} is already waiting for a download`);
     }
     activeDownloadTargets.add(targetId);
-    const directory = mkdtempSync(join(tmpdir(), "ego-browser-download-"));
-    artifactDirectories.add(directory);
-    const directoryPromise = Promise.resolve(directory);
+    const token = Symbol(targetId);
     const configuredSessions = new Set();
     let guid;
+    let filePath;
     let disposed = false;
     let settled = false;
     let filePollTimer;
@@ -15526,12 +15920,29 @@ function preparePageDownload(services, targetId, { timeoutMs }) {
     const completion = new Promise((resolve) => {
         resolveCompletion = resolve;
     });
-    const resetBehavior = async () => {
+    // Decide synchronously whether this waiter was the last one, and send the
+    // reset in the same tick, so a `ready()` that follows in this process always
+    // sends its setting after the reset.
+    const restoreBehavior = async () => {
         const sessions = [...configuredSessions];
         configuredSessions.clear();
-        await Promise.all(sessions.map((sessionId) => services
+        if (!releaseSharedBehavior(token))
+            return;
+        const restored = await Promise.all(sessions.map((sessionId) => services
             .cdp("Page.setDownloadBehavior", { behavior: "default" }, sessionId, 1_000)
-            .catch(() => { })));
+            .then(() => sessionId, () => undefined)));
+        // Another process may have registered, and sent its setting, between the
+        // marker check and Chromium applying the reset; its setting then lost.
+        // The reset has been applied once its response is back, so a marker seen
+        // now belongs to a waiter whose later sends land after it, and one seen
+        // from before only needs the setting put back for it.
+        const session = restored.find((sessionId) => sessionId !== undefined);
+        if (!session || armedInterceptions.size > 0 || !hasOtherLiveWaiter()) {
+            return;
+        }
+        await services
+            .cdp("Page.setDownloadBehavior", { behavior: "allowAndName", downloadPath: downloadDirectory() }, session, 1_000)
+            .catch(() => { });
     };
     const finish = async (result) => {
         if (settled)
@@ -15542,31 +15953,34 @@ function preparePageDownload(services, targetId, { timeoutMs }) {
             clearTimeout(filePollTimer);
         unsubscribe();
         activeInterceptions.delete(disposeSynchronously);
-        await resetBehavior();
+        await restoreBehavior();
         activeDownloadTargets.delete(targetId);
         resolveCompletion(result);
     };
+    // Chromium writes `<guid>.crdownload` and renames it to `<guid>` once the
+    // download completes, so the final name appearing is the completion signal
+    // even when the final progress event never arrives.
     const checkForDownloadedFile = async () => {
         filePollTimer = undefined;
-        if (disposed || settled || !guid)
+        if (disposed || settled || !filePath)
             return;
         try {
-            const path = await directoryPromise.then(findDownloadedFile);
-            if (path) {
-                await finish({ path, failure: null });
-                return;
-            }
+            await stat(filePath);
         }
         catch (error) {
+            if (error?.code === "ENOENT") {
+                scheduleFileCheck();
+                return;
+            }
             await finish({ failure: asError$1(error).message });
             return;
         }
-        scheduleFileCheck();
+        await finish({ path: filePath, failure: null });
     };
     const scheduleFileCheck = () => {
         if (disposed || settled || filePollTimer)
             return;
-        filePollTimer = setTimeout(() => void checkForDownloadedFile(), 50);
+        filePollTimer = setTimeout(() => void checkForDownloadedFile(), FILE_POLL_INTERVAL_MS);
     };
     const onEvent = (message) => {
         const params = message?.params;
@@ -15577,8 +15991,10 @@ function preparePageDownload(services, targetId, { timeoutMs }) {
                 return;
             }
             guid = params.guid;
+            filePath = join(downloadDirectory(), params.guid);
+            ownedFiles.add(filePath);
             clearTimeout(timer);
-            resolveEvent(new PageDownloadArtifact(services, targetId, params.guid, params.url, params.suggestedFilename, directoryPromise, completion));
+            resolveEvent(new PageDownloadArtifact(services, targetId, params.guid, params.url, params.suggestedFilename, filePath, completion));
             scheduleFileCheck();
             return;
         }
@@ -15605,7 +16021,7 @@ function preparePageDownload(services, targetId, { timeoutMs }) {
             clearTimeout(filePollTimer);
         unsubscribe();
         activeDownloadTargets.delete(targetId);
-        void resetBehavior();
+        void restoreBehavior();
         rejectEvent(new Error("download waiter was disposed"));
         resolveCompletion({ failure: "download waiter was disposed" });
     };
@@ -15617,11 +16033,10 @@ function preparePageDownload(services, targetId, { timeoutMs }) {
         unsubscribe();
         activeInterceptions.delete(disposeSynchronously);
         void (async () => {
-            await resetBehavior();
+            await restoreBehavior();
             activeDownloadTargets.delete(targetId);
             rejectEvent(new Error(`page.waitForEvent("download") timed out after ${timeoutMs}ms`));
             resolveCompletion({ failure: "download did not start" });
-            await directoryPromise.then(removeArtifactDirectory);
         })();
     }, timeoutMs);
     return {
@@ -15629,9 +16044,12 @@ function preparePageDownload(services, targetId, { timeoutMs }) {
             if (disposed || settled) {
                 throw new Error("download waiter is no longer active");
             }
-            const downloadPath = await directoryPromise;
-            await services.cdp("Page.setDownloadBehavior", { behavior: "allow", downloadPath }, sessionId);
+            const downloadPath = downloadDirectory();
+            // Register the session before sending: a rejected call (a timeout, say)
+            // may still have been applied, and the restore must reach that session.
             configuredSessions.add(sessionId);
+            claimSharedBehavior(token);
+            await services.cdp("Page.setDownloadBehavior", { behavior: "allowAndName", downloadPath }, sessionId);
         },
         event,
         async dispose(reason = new Error("download waiter was disposed")) {
@@ -15643,11 +16061,10 @@ function preparePageDownload(services, targetId, { timeoutMs }) {
                 clearTimeout(filePollTimer);
             unsubscribe();
             activeInterceptions.delete(disposeSynchronously);
-            await resetBehavior();
+            await restoreBehavior();
             activeDownloadTargets.delete(targetId);
             rejectEvent(reason);
             resolveCompletion({ failure: reason.message });
-            await directoryPromise.then(removeArtifactDirectory);
         },
     };
 }
@@ -15658,16 +16075,16 @@ class PageDownloadArtifact {
     #services;
     #targetId;
     #guid;
-    #directory;
+    #filePath;
     #completion;
     #completionResult;
-    constructor(services, targetId, guid, url, suggestedFilename, directory, completion) {
+    constructor(services, targetId, guid, url, suggestedFilename, filePath, completion) {
         this.#services = services;
         this.#targetId = targetId;
         this.#guid = guid;
         this.url = url;
         this.suggestedFilename = suggestedFilename;
-        this.#directory = directory;
+        this.#filePath = filePath;
         this.#completion = completion;
         this.finished = completion.then((result) => {
             this.#completionResult = result;
@@ -15710,20 +16127,111 @@ class PageDownloadArtifact {
     }
     async delete() {
         await this.#completion;
-        await removeArtifactDirectory(await this.#directory);
+        ownedFiles.delete(this.#filePath);
+        await rm(this.#filePath, { force: true });
     }
 }
-async function findDownloadedFile(directory) {
-    const entries = await readdir(directory, { withFileTypes: true });
-    const files = entries.filter((entry) => entry.isFile() && !entry.name.endsWith(".crdownload"));
-    if (files.length > 1) {
-        throw new Error(`download completed with ${files.length} files in its temporary directory`);
+// Every process that waits for a download leaves `waiters/<pid>` in the shared
+// directory while it waits. The last live waiter restores the default
+// behavior; the others leave it alone so their downloads keep landing here.
+// A marker is rewritten while its process waits, so one that stopped aging
+// belongs to a process that died and whose pid another process now holds.
+function claimSharedBehavior(token) {
+    armedInterceptions.add(token);
+    writeWaiterMarker();
+    if (!waiterRefreshTimer) {
+        waiterRefreshTimer = setInterval(writeWaiterMarker, WAITER_REFRESH_MS);
+        waiterRefreshTimer.unref?.();
     }
-    return files.length === 1 ? join(directory, files[0].name) : undefined;
 }
-async function removeArtifactDirectory(directory) {
-    artifactDirectories.delete(directory);
-    await rm(directory, { recursive: true, force: true });
+function releaseSharedBehavior(token) {
+    armedInterceptions.delete(token);
+    if (armedInterceptions.size > 0)
+        return false;
+    stopWaiterMarker();
+    return !hasOtherLiveWaiter();
+}
+function writeWaiterMarker() {
+    try {
+        writeFileSync(waiterMarkerPath(), JSON.stringify({ pid: process.pid, since: Date.now() }));
+    }
+    catch {
+        // A read-only state directory only loses cross-process coordination.
+    }
+}
+function stopWaiterMarker() {
+    if (waiterRefreshTimer)
+        clearInterval(waiterRefreshTimer);
+    waiterRefreshTimer = undefined;
+    rmSync(waiterMarkerPath(), { force: true });
+}
+function waiterMarkerPath() {
+    return join(downloadDirectory(), WAITERS_DIRECTORY, String(process.pid));
+}
+function hasOtherLiveWaiter() {
+    const waitersDirectory = join(downloadDirectory(), WAITERS_DIRECTORY);
+    let names;
+    try {
+        names = readdirSync(waitersDirectory);
+    }
+    catch {
+        return false;
+    }
+    const now = Date.now();
+    for (const name of names) {
+        const path = join(waitersDirectory, name);
+        const pid = Number(name);
+        if (pid === process.pid)
+            continue;
+        let stale = !Number.isInteger(pid) || !isProcessAlive(pid);
+        if (!stale) {
+            try {
+                stale = now - statSync(path).mtimeMs > STALE_WAITER_MS;
+            }
+            catch {
+                continue;
+            }
+        }
+        if (stale) {
+            rmSync(path, { force: true });
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+function isProcessAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (error) {
+        return error?.code === "EPERM";
+    }
+}
+// Files a process could not clean up (a crash mid-download) would otherwise
+// stay forever; anything older than a day is nobody's pending download.
+function removeStaleFiles(directory) {
+    let entries;
+    try {
+        entries = readdirSync(directory, { withFileTypes: true });
+    }
+    catch {
+        return;
+    }
+    const cutoff = Date.now() - STALE_FILE_MS;
+    for (const entry of entries) {
+        if (!entry.isFile())
+            continue;
+        const path = join(directory, entry.name);
+        try {
+            if (statSync(path).mtimeMs < cutoff)
+                rmSync(path, { force: true });
+        }
+        catch {
+            // Another process may have removed it first.
+        }
+    }
 }
 function assertAbsolutePath(path, method) {
     if (typeof path !== "string" || path.length === 0 || !isAbsolute(path)) {
@@ -15733,16 +16241,22 @@ function assertAbsolutePath(path, method) {
 function asError$1(error) {
     return error instanceof Error ? error : new Error(String(error));
 }
-/** Remove round-local files and stop pending waits during SDK disposal. */
+/** Remove this process's download files and stop pending waits during SDK disposal. */
 function disposeDownloadArtifacts() {
     for (const dispose of [...activeInterceptions])
         dispose();
     activeInterceptions.clear();
     activeDownloadTargets.clear();
-    for (const directory of artifactDirectories) {
-        rmSync(directory, { recursive: true, force: true });
+    if (armedInterceptions.size > 0) {
+        armedInterceptions.clear();
+        if (sharedDirectory)
+            stopWaiterMarker();
     }
-    artifactDirectories.clear();
+    for (const path of ownedFiles) {
+        rmSync(path, { force: true });
+        rmSync(`${path}.crdownload`, { force: true });
+    }
+    ownedFiles.clear();
 }
 
 const KEYPAD_LOCATION = 3;
@@ -16312,6 +16826,13 @@ function isTransientElementError(error) {
 class PageNavigationTimeoutError extends Error {
     code = "EGO_NAVIGATION_TIMEOUT";
     committed;
+    /**
+     * The Page did not answer at the deadline, so the harness sent
+     * Page.stopLoading and the Page answered again: with `committed` false it
+     * still shows its previous document, with `committed` true the navigation
+     * landed at the deadline and only its remaining loading was stopped.
+     */
+    stopped;
     url;
     readyState;
     waitUntil;
@@ -16320,12 +16841,23 @@ class PageNavigationTimeoutError extends Error {
         super(message);
         this.name = "PageNavigationTimeoutError";
         this.committed = details.committed;
+        this.stopped = details.stopped === true;
         this.url = details.url;
         this.readyState = details.readyState;
         this.waitUntil = details.waitUntil;
         this.timeoutMs = details.timeoutMs;
     }
 }
+// Page.stopLoading is answered by the browser process, so a pending
+// navigation cannot stall it; the frame-tree probe afterwards confirms the
+// renderer answers again. Both stay short: they run after the caller's
+// deadline has already passed.
+const STOP_PENDING_NAVIGATION_TIMEOUT_MS = 1_000;
+// A responsive Page answers Page.getFrameTree within milliseconds. The probe
+// before Page.navigate only records the current document; the probe at the
+// deadline decides whether the navigation is still pending.
+const PREVIOUS_DOCUMENT_PROBE_TIMEOUT_MS = 500;
+const NAVIGATION_DEADLINE_PROBE_TIMEOUT_MS = 250;
 const VISIBILITY_FUNCTION = "function(){if(typeof this.checkVisibility==='function')return this.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});const s=getComputedStyle(this);const r=this.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'&&r.width>0&&r.height>0;}";
 /** Wait for a selector inside one explicit Page session. */
 async function waitForSelectorInPage(services, sessionId, refMap, selector, options = {}, getIframeSessions) {
@@ -16578,8 +17110,10 @@ function invalidURLGlobError(glob, reason) {
 /** Navigate one Page and wait for the selected state of this navigation. */
 async function navigateInPage(services, sessionId, url, options) {
     const { timeoutMs, waitUntil, referer } = options;
-    const deadline = services.now() + timeoutMs;
+    const deadline = options.deadline ?? services.now() + timeoutMs;
     let committed = false;
+    let navigateSent = false;
+    let previousFrame = {};
     let navigation = {};
     try {
         // Network tracking must start before Page.navigate or the initial document
@@ -16587,10 +17121,19 @@ async function navigateInPage(services, sessionId, url, options) {
         if (waitUntil === "networkidle") {
             await services.ensureNetworkTracking([sessionId], navigationTimeRemaining(services, deadline, timeoutMs, waitUntil));
         }
+        // Chromium answers Page.navigate only once the navigation is ready to
+        // commit or has failed, so a held response leaves this call without a
+        // loaderId. The document in place before the request is the reference
+        // the deadline probe compares against instead.
+        previousFrame = await mainFrameIfResponsive(services, sessionId, Math.min(PREVIOUS_DOCUMENT_PROBE_TIMEOUT_MS, navigationTimeRemaining(services, deadline, timeoutMs, waitUntil)));
+        // The budget check can throw at the deadline; only a request that was
+        // actually dispatched may be stopped later.
+        const navigateBudgetMs = navigationTimeRemaining(services, deadline, timeoutMs, waitUntil);
+        navigateSent = true;
         const response = await services.cdp("Page.navigate", {
             url,
             ...(referer === undefined ? {} : { referrer: referer }),
-        }, sessionId, navigationTimeRemaining(services, deadline, timeoutMs, waitUntil));
+        }, sessionId, navigateBudgetMs);
         navigation = response?.result || response || {};
         if (navigation.errorText) {
             throw new Error(`page.goto failed: ${navigation.errorText}`);
@@ -16608,33 +17151,136 @@ async function navigateInPage(services, sessionId, url, options) {
     }
     catch (error) {
         if (services.now() >= deadline || isLoadStateTimeout(error)) {
-            if (!committed && navigation.loaderId) {
-                committed = await navigationMatchesCurrentFrame(services, sessionId, navigation, 250);
+            let probe = committed ? "committed" : "not-committed";
+            if (!committed && navigateSent) {
+                probe = await probeNavigation(services, sessionId, navigation, previousFrame);
             }
+            // Chromium suspends every renderer-bound command while a main-frame
+            // navigation has started but not committed, so leaving it pending would
+            // hand back a Page that stalls each later call for a full transport
+            // timeout. The caller asked for a bounded wait: stop the navigation and
+            // leave the Page usable on its previous document. A hung renderer looks
+            // the same from here and cannot be told apart without an answer from
+            // it; stopping is still safe then, because the navigation this call
+            // itself started is the only load in flight that the caller asked for,
+            // and the frame read after the stop reports what is actually in place.
+            let stopped = false;
+            if (probe === "unresponsive") {
+                const outcome = await stopPendingNavigation(services, sessionId, navigation, previousFrame);
+                stopped = outcome !== "unresponsive";
+                if (outcome === "committed")
+                    probe = "committed";
+            }
+            committed = probe === "committed";
             const state = committed
                 ? await currentDocumentState(services, sessionId)
                 : {};
             throw navigationTimeout(timeoutMs, waitUntil, {
                 committed,
                 ...state,
+                stopped,
+                pending: probe === "unresponsive",
+                requestedUrl: url,
             });
         }
         throw error;
     }
 }
+/**
+ * Whether the main frame shows the document a navigation was for: the
+ * loaderId Page.navigate reported when there is one, otherwise any change
+ * from the document that was in place before the request.
+ */
+function frameShowsNavigation(frame, navigation, previousFrame) {
+    if (navigation.loaderId) {
+        return (frame.loaderId === navigation.loaderId &&
+            (!navigation.frameId || frame.id === navigation.frameId));
+    }
+    return Boolean(previousFrame.loaderId &&
+        frame.loaderId &&
+        frame.loaderId !== previousFrame.loaderId);
+}
+/**
+ * One short frame-tree probe at a navigation deadline. A Page that answers
+ * has no main-frame navigation pending: either the requested document is in
+ * place or nothing replaced the previous one. A Page that does not answer
+ * still has the navigation pending.
+ */
+async function probeNavigation(services, sessionId, navigation, previousFrame) {
+    let frame;
+    try {
+        frame = await mainFrame(services, sessionId, NAVIGATION_DEADLINE_PROBE_TIMEOUT_MS);
+    }
+    catch (error) {
+        if (isCdpTimeout(error, "Page.getFrameTree"))
+            return "unresponsive";
+        // Any other failure is not evidence of a pending navigation.
+        return "not-committed";
+    }
+    return frameShowsNavigation(frame, navigation, previousFrame)
+        ? "committed"
+        : "not-committed";
+}
+/** The main frame, or an empty record when the Page does not answer in time. */
+async function mainFrameIfResponsive(services, sessionId, timeoutMs) {
+    try {
+        return await mainFrame(services, sessionId, timeoutMs);
+    }
+    catch {
+        return {};
+    }
+}
+/**
+ * Stop a navigation that has not committed and read the main frame once the
+ * Page answers again. The navigation may commit between the deadline probe
+ * and the stop taking effect, so the frame read afterwards decides whether
+ * the previous document is still in place ("stopped") or the new one is
+ * ("committed", with its loading stopped). A hung renderer answers neither.
+ */
+async function stopPendingNavigation(services, sessionId, navigation, previousFrame) {
+    try {
+        await services.cdp("Page.stopLoading", {}, sessionId, STOP_PENDING_NAVIGATION_TIMEOUT_MS);
+        const frame = await mainFrame(services, sessionId, STOP_PENDING_NAVIGATION_TIMEOUT_MS);
+        return frameShowsNavigation(frame, navigation, previousFrame)
+            ? "committed"
+            : "stopped";
+    }
+    catch {
+        return "unresponsive";
+    }
+}
+/**
+ * The sentence a timeout error adds when the navigation it waited for is
+ * still pending or was stopped, so the agent knows which document the Page
+ * shows and what to do next.
+ */
+function pendingNavigationNote(what, outcome, retry) {
+    if (outcome === "stopped") {
+        return `; ${what} had not committed and was stopped, so the Page still shows its previous document. Retry ${retry} with a longer timeout, or continue on a new Page from task.newPage().`;
+    }
+    if (outcome === "committed") {
+        return `; ${what} committed at the deadline but its loading was stopped. Call page.reload({ timeout }) if the rest of the document is required.`;
+    }
+    return `; ${what} has not committed and the Page did not answer even after Page.stopLoading, so its renderer is probably hung. Continue on a new Page from task.newPage(), or close this Page and open it again.`;
+}
 /** Reload one Page and wait for the selected state of the new document. */
 async function reloadInPage(services, sessionId, options) {
     const { timeoutMs, waitUntil } = options;
-    const deadline = services.now() + timeoutMs;
+    const deadline = options.deadline ?? services.now() + timeoutMs;
+    let reloadSent = false;
+    let committed = false;
+    let previousFrame = {};
     try {
-        const previousFrame = await mainFrame(services, sessionId, reloadTimeRemaining(services, deadline, timeoutMs, waitUntil));
+        previousFrame = await mainFrame(services, sessionId, reloadTimeRemaining(services, deadline, timeoutMs, waitUntil));
         if (waitUntil === "networkidle") {
             await services.ensureNetworkTracking([sessionId], reloadTimeRemaining(services, deadline, timeoutMs, waitUntil));
         }
         await services.cdp("Page.reload", previousFrame.loaderId === undefined
             ? {}
             : { loaderId: previousFrame.loaderId }, sessionId, reloadTimeRemaining(services, deadline, timeoutMs, waitUntil));
+        reloadSent = true;
         await waitForReloadCommit(services, sessionId, previousFrame, deadline, timeoutMs, waitUntil);
+        committed = true;
         if (waitUntil === "commit")
             return;
         await waitForLoadStateInPage(services, sessionId, waitUntil, {
@@ -16643,7 +17289,15 @@ async function reloadInPage(services, sessionId, options) {
     }
     catch (error) {
         if (services.now() >= deadline || isLoadStateTimeout(error)) {
-            throw reloadTimeout(timeoutMs, waitUntil);
+            // Same as page.goto: a reload that has not committed stalls every later
+            // call on this Page, so stop it before reporting the timeout.
+            const pending = !committed &&
+                reloadSent &&
+                (await probeNavigation(services, sessionId, {}, previousFrame)) ===
+                    "unresponsive";
+            throw reloadTimeout(timeoutMs, waitUntil, pending
+                ? pendingNavigationNote("the reload", await stopPendingNavigation(services, sessionId, {}, previousFrame), "page.reload({ timeout })")
+                : "");
         }
         throw error;
     }
@@ -16680,8 +17334,8 @@ function reloadTimeRemaining(services, deadline, timeoutMs, waitUntil) {
         throw reloadTimeout(timeoutMs, waitUntil);
     return remaining;
 }
-function reloadTimeout(timeoutMs, waitUntil) {
-    return new Error(`page.reload timed out after ${timeoutMs}ms waiting for ${waitUntil}`);
+function reloadTimeout(timeoutMs, waitUntil, note = "") {
+    return new Error(`page.reload timed out after ${timeoutMs}ms waiting for ${waitUntil}${note}`);
 }
 async function waitForNavigationCommit(services, sessionId, navigation, deadline, timeoutMs, waitUntil) {
     // CDP omits loaderId for a same-document navigation. Page.navigate has
@@ -16710,19 +17364,6 @@ async function waitForNavigationCommit(services, sessionId, navigation, deadline
     }
     throw navigationTimeout(timeoutMs, waitUntil);
 }
-async function navigationMatchesCurrentFrame(services, sessionId, navigation, timeoutMs) {
-    try {
-        const response = await services.cdp("Page.getFrameTree", {}, sessionId, timeoutMs);
-        const frame = response?.result?.frameTree?.frame || response?.frameTree?.frame;
-        return (Boolean(navigation.loaderId) &&
-            frame?.loaderId === navigation.loaderId &&
-            (!navigation.frameId || frame?.id === navigation.frameId));
-    }
-    catch {
-        // This is a best-effort timeout diagnostic, not a second navigation path.
-        return false;
-    }
-}
 function navigationTimeRemaining(services, deadline, timeoutMs, waitUntil) {
     const remaining = deadline - services.now();
     if (remaining <= 0)
@@ -16731,12 +17372,20 @@ function navigationTimeRemaining(services, deadline, timeoutMs, waitUntil) {
 }
 function navigationTimeout(timeoutMs, waitUntil, details = {}) {
     const committed = details.committed === true;
-    const nextStep = navigationTimeoutNextStep(waitUntil);
-    const state = committed
-        ? `; navigation committed${details.url ? ` at ${JSON.stringify(details.url)}` : ""}${details.readyState ? ` with document.readyState=${JSON.stringify(details.readyState)}` : ""}. ${nextStep}`
-        : "";
+    const stopped = details.stopped === true;
+    let state = "";
+    if (committed) {
+        const where = `${details.url ? ` at ${JSON.stringify(details.url)}` : ""}${details.readyState ? ` with document.readyState=${JSON.stringify(details.readyState)}` : ""}`;
+        state = stopped
+            ? `; navigation committed${where}, but its loading was stopped at the deadline. Call page.reload({ timeout }) if the rest of the document is required.`
+            : `; navigation committed${where}. ${navigationTimeoutNextStep(waitUntil)}`;
+    }
+    else if (stopped || details.pending) {
+        state = pendingNavigationNote(`the navigation${details.requestedUrl ? ` to ${JSON.stringify(details.requestedUrl)}` : ""}`, stopped ? "stopped" : "unresponsive", "page.goto(url, { timeout })");
+    }
     return new PageNavigationTimeoutError(`page.goto timed out after ${timeoutMs}ms waiting for ${waitUntil}${state}`, {
         committed,
+        stopped,
         url: details.url,
         readyState: details.readyState,
         waitUntil,
@@ -16855,6 +17504,7 @@ function isTransientNavigationContextError(error) {
 async function waitForNetworkIdle(services, sessionId, timeoutMs, idleMs) {
     const deadline = services.now() + timeoutMs;
     let sessionIds = [];
+    let lastActivity;
     while (services.now() <= deadline) {
         try {
             // OOPIFs can appear while the Page is loading. Refreshing before every
@@ -16867,6 +17517,7 @@ async function waitForNetworkIdle(services, sessionId, timeoutMs, idleMs) {
                 break;
             await services.ensureNetworkTracking(sessionIds, trackingBudget);
             const activity = services.networkActivity(sessionIds);
+            lastActivity = activity;
             if (activity.tracking &&
                 activity.inflight === 0 &&
                 services.now() - activity.lastActivityAt >= idleMs) {
@@ -16884,7 +17535,20 @@ async function waitForNetworkIdle(services, sessionId, timeoutMs, idleMs) {
             break;
         await services.sleep(Math.min(50, waitMs));
     }
-    throw new Error(`page.waitForLoadState(networkidle) timed out after ${timeoutMs}ms`);
+    throw new Error(`page.waitForLoadState(networkidle) timed out after ${timeoutMs}ms` +
+        describeNetworkActivity(lastActivity));
+}
+function describeNetworkActivity(activity) {
+    if (!activity)
+        return "";
+    if (!activity.tracking)
+        return " (network tracking unavailable)";
+    const pending = activity.pendingRequests || [];
+    if (pending.length === 0)
+        return "";
+    const shown = pending.slice(0, 5).join(", ");
+    const more = pending.length > 5 ? ` and ${pending.length - 5} more` : "";
+    return ` (${pending.length} requests still in flight: ${shown}${more})`;
 }
 function isRetryableNetworkRefreshError(error) {
     if (isCdpRequestTimeoutError(error) || isSessionLostError(error))
@@ -16954,7 +17618,7 @@ class NativeOperationGate {
         this.#tail = result.then(() => undefined, () => undefined);
         return result;
     }
-    withPage(page, operation) {
+    withPage(page, operation, options = {}) {
         if (!page || typeof page !== "object") {
             throw new TypeError("withPage requires a page target");
         }
@@ -16966,7 +17630,7 @@ class NativeOperationGate {
             throw new TypeError("withPage requires an operation function");
         }
         return this.withSpace(page.spaceId, async () => {
-            const sessionId = await this.#services.ensureSession(page.targetId);
+            const sessionId = await this.#services.ensureSession(page.targetId, options.sessionTimeoutMs);
             return operation({
                 spaceId: page.spaceId,
                 targetId: page.targetId,
@@ -16993,8 +17657,8 @@ const defaultGate$1 = new NativeOperationGate({
 function withSpace(spaceId, operation) {
     return defaultGate$1.withSpace(spaceId, operation);
 }
-function withPage(page, operation) {
-    return defaultGate$1.withPage(page, operation);
+function withPage(page, operation, options = {}) {
+    return defaultGate$1.withPage(page, operation, options);
 }
 
 const MAX_INVALIDATED_REFS_PER_TARGET = 10_000;
@@ -17172,6 +17836,31 @@ function assertTargetId$1(targetId) {
 }
 
 const DEFAULT_STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_WRITE_CONFLICTS = 8;
+const LEDGER_FILE_PATTERN = /^space-\d+(@[A-Za-z0-9_-]+)?(\.\d+)?\.json$/;
+/**
+ * Codes under which an existing ledger version cannot be opened right now.
+ * Windows reports a file that another process holds without read sharing as
+ * EPERM/EACCES/EBUSY. The hold normally clears within milliseconds, so the
+ * read is retried briefly (about 1.8 s in total) before it fails. The locked
+ * version is still the current ledger: reading an older version, or an empty
+ * ledger, in its place would let the next write supersede it with stale state
+ * that outlives the lock.
+ */
+const LOCKED_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const LOCKED_READ_ATTEMPTS = 10;
+const LOCKED_READ_BASE_MS = 20;
+const LOCKED_READ_MAX_MS = 250;
+/** A version with the next sequence number appeared between load and write. */
+class LedgerWriteConflict extends Error {
+}
+/** The current ledger version is held open by another process. */
+class LedgerLockedError extends Error {
+    constructor(path, cause) {
+        super(`cannot read page ledger ${path}: ${cause.message}. Another process holds the file open; the ledger was left unchanged`, { cause });
+        this.name = "LedgerLockedError";
+    }
+}
 /** Stable across Agent rounds and Node-service restarts in one Ego Lite run. */
 function runtimeInstanceId(parentPid = process.ppid) {
     // Linux port: ego-browser nodejs runs each script in its own short-lived
@@ -17184,30 +17873,43 @@ function runtimeInstanceId(parentPid = process.ppid) {
     return `browser-host:${parentPid}`;
 }
 /**
- * Stores durable page labels in one JSON document per task space. Each update
- * replaces the complete document with an atomic rename so readers never see a
- * partially written ledger.
+ * Stores durable page labels in one JSON document per task space and browser
+ * instance. Space ids restart at 1 in every Ego Lite instance, so concurrent
+ * instances sharing the state directory must not share a file.
+ *
+ * Every write creates a new numbered version (`space-<id>@<instance>.<n>.json`)
+ * and the highest version that parses is the current ledger. No file is ever
+ * renamed over or truncated in place: on Windows, replacing a file that
+ * another process (an antivirus scan, the search indexer, a concurrent
+ * reader) holds open fails with EPERM for as long as that handle stays open,
+ * which used to abort the caller's script. Superseded versions are removed
+ * best-effort after each write, so one that is still held open is simply
+ * left for a later write. Readers skip a version that is gone or does not
+ * parse yet, so a write in progress is invisible until it is complete; a
+ * version that exists but is locked is retried and then reported, never
+ * replaced.
  */
 class PageLedgerStore {
     rootDir;
-    #writeToken = randomUUID();
     #browserInstanceId;
     #staleAfterMs;
     #now;
-    #temporarySequence = 0;
+    #remove;
+    #read;
+    #sleep;
     #resolvedBrowserInstanceId;
     #cleanup;
     constructor(options = {}) {
-        this.rootDir =
-            options.rootDir ||
-                process.env.EGO_BROWSER_STATE_DIR ||
-                join(homedir(), ".ego-browser", "state");
+        this.rootDir = options.rootDir || runtimeStateDir();
         this.#browserInstanceId = options.browserInstanceId;
         this.#staleAfterMs =
             options.staleAfterMs === undefined
                 ? DEFAULT_STALE_AFTER_MS
                 : options.staleAfterMs;
         this.#now = options.now || Date.now;
+        this.#remove = options.remove || ((path) => rm(path, { force: true }));
+        this.#read = options.read || ((path) => readFile(path, "utf8"));
+        this.#sleep = options.sleep || setTimeout$1;
         if (!Number.isFinite(this.#staleAfterMs) || this.#staleAfterMs < 0) {
             throw new TypeError("staleAfterMs must be a non-negative number");
         }
@@ -17229,13 +17931,18 @@ class PageLedgerStore {
         ledger.initialized = true;
         ledger.usedLabels.push(label);
         ledger.pages[label] = entry;
-        await this.#writeAtomic(spaceId, ledger);
+        await this.#writeLatest(spaceId, ledger);
         return { label, ...entry };
     }
-    /** Remove all Page-model state after its task space is finished or closed. */
+    /**
+     * Remove all Page-model state after its task space is finished or closed.
+     * A version that another process still holds open stays behind; it is
+     * expired like any other stale ledger.
+     */
     async discard(spaceId) {
         assertSpaceId(spaceId);
-        await rm(this.#path(spaceId), { force: true });
+        const browserInstanceId = await this.#currentBrowserInstanceId();
+        await this.#removeAll(await this.#listVersions(spaceId, browserInstanceId));
     }
     async getPage(spaceId, label) {
         assertLabel(label);
@@ -17422,47 +18129,148 @@ class PageLedgerStore {
     }
     async #update(spaceId, mutate) {
         assertSpaceId(spaceId);
-        const next = await this.#readCurrent(spaceId);
-        mutate(next);
-        await this.#writeAtomic(spaceId, next);
-        return cloneLedger(next);
+        for (let conflicts = 0;; conflicts++) {
+            const { ledger, files } = await this.#load(spaceId);
+            mutate(ledger);
+            try {
+                await this.#write(spaceId, ledger, files);
+                return cloneLedger(ledger);
+            }
+            catch (error) {
+                if (!(error instanceof LedgerWriteConflict) ||
+                    conflicts >= MAX_WRITE_CONFLICTS) {
+                    throw error;
+                }
+            }
+        }
     }
     async #readCurrent(spaceId) {
+        return (await this.#load(spaceId)).ledger;
+    }
+    /**
+     * The current ledger plus every version file it was chosen from. A version
+     * held open by another process is retried with backoff, then reported.
+     */
+    async #load(spaceId) {
+        for (let attempt = 0;; attempt++) {
+            try {
+                return await this.#loadOnce(spaceId);
+            }
+            catch (error) {
+                if (!(error instanceof LedgerLockedError) ||
+                    attempt >= LOCKED_READ_ATTEMPTS) {
+                    throw error;
+                }
+                await this.#sleep(Math.min(LOCKED_READ_BASE_MS * 2 ** attempt, LOCKED_READ_MAX_MS));
+            }
+        }
+    }
+    async #loadOnce(spaceId) {
         const browserInstanceId = await this.#currentBrowserInstanceId();
         await this.#cleanupExpiredLedgers(browserInstanceId);
-        const path = this.#path(spaceId);
-        let raw;
+        const files = await this.#listVersions(spaceId, browserInstanceId);
+        for (const file of files) {
+            const stored = await this.#readLedgerJson(file.path);
+            if (stored === undefined)
+                continue;
+            return {
+                ledger: ownedLedger(stored, spaceId, file.path, browserInstanceId) ||
+                    emptyLedger(spaceId, browserInstanceId),
+                files,
+            };
+        }
+        if (browserInstanceId === undefined || files.length > 0) {
+            return { ledger: emptyLedger(spaceId, browserInstanceId), files };
+        }
+        // Earlier SDKs wrote every instance's ledger to the shared space file.
+        // Move this instance's ledger (or one from before instance ids existed)
+        // so an SDK upgrade does not discard live Page labels.
+        const legacyPath = this.#legacyPath(spaceId);
+        const legacy = await this.#readLedgerJson(legacyPath);
+        const ledger = legacy === undefined
+            ? undefined
+            : ownedLedger(legacy, spaceId, legacyPath, browserInstanceId);
+        if (!ledger) {
+            return { ledger: emptyLedger(spaceId, browserInstanceId), files };
+        }
+        ledger.browserInstanceId = browserInstanceId;
+        const written = await this.#writeLatest(spaceId, ledger);
+        await this.#remove(legacyPath).catch(() => { });
+        return { ledger, files: written };
+    }
+    /** Write `ledger` as the next version, whatever versions exist right now. */
+    async #writeLatest(spaceId, ledger) {
+        const browserInstanceId = await this.#currentBrowserInstanceId();
+        for (let conflicts = 0;; conflicts++) {
+            const files = await this.#listVersions(spaceId, browserInstanceId);
+            try {
+                return await this.#write(spaceId, ledger, files);
+            }
+            catch (error) {
+                if (!(error instanceof LedgerWriteConflict) ||
+                    conflicts >= MAX_WRITE_CONFLICTS) {
+                    throw error;
+                }
+            }
+        }
+    }
+    /**
+     * Create the version after `files` (the listing the ledger was loaded
+     * from), then remove those superseded versions. Another writer that got
+     * there first raises LedgerWriteConflict so the caller reloads instead of
+     * overwriting its update.
+     */
+    async #write(spaceId, ledger, files) {
+        await mkdir(this.rootDir, { recursive: true, mode: 0o700 });
+        const seq = (files[0]?.seq ?? 0) + 1;
+        const path = `${this.#base(spaceId, await this.#currentBrowserInstanceId())}.${seq}.json`;
         try {
-            raw = await readFile(path, "utf8");
+            await writeFile(path, `${JSON.stringify(ledger, null, 2)}\n`, {
+                encoding: "utf8",
+                flag: "wx",
+                mode: 0o600,
+            });
         }
         catch (error) {
-            if (error?.code === "ENOENT") {
-                return emptyLedger(spaceId, browserInstanceId);
+            if (error?.code === "EEXIST") {
+                throw new LedgerWriteConflict(`page ledger ${path} was written concurrently`);
             }
             throw error;
         }
-        let parsed;
+        await this.#removeAll(files);
+        return [{ seq, path }];
+    }
+    /** Best-effort removal: a version held open elsewhere is left behind. */
+    async #removeAll(files) {
+        await Promise.all(files.map((file) => this.#remove(file.path).catch(() => { })));
+    }
+    /** Every version of one space's ledger, newest first; the unnumbered legacy file is version 0. */
+    async #listVersions(spaceId, browserInstanceId) {
+        let names;
         try {
-            parsed = JSON.parse(raw);
+            names = await readdir(this.rootDir);
         }
         catch (error) {
-            throw new Error(`invalid page ledger ${path}: ${error.message}`);
+            if (error?.code === "ENOENT")
+                return [];
+            throw error;
         }
-        const storedBrowserInstanceId = ledgerBrowserInstanceId(parsed);
-        if (browserInstanceId !== undefined &&
-            storedBrowserInstanceId !== undefined &&
-            storedBrowserInstanceId !== browserInstanceId) {
-            return emptyLedger(spaceId, browserInstanceId);
-        }
-        const ledger = validateLedger(parsed, spaceId, path);
-        if (browserInstanceId !== undefined &&
-            storedBrowserInstanceId === undefined) {
-            // Preserve ledgers created before instance ids existed. This one-time
-            // backfill avoids discarding live Page labels during an SDK upgrade.
-            ledger.browserInstanceId = browserInstanceId;
-            await this.#writeAtomic(spaceId, ledger);
-        }
-        return ledger;
+        // The base holds only digits and a sanitized [A-Za-z0-9_-] scope.
+        const base = `space-${spaceId}${scopeSuffix(browserInstanceId)}`;
+        const pattern = new RegExp(`^${base}(?:\\.(\\d+))?\\.json$`);
+        return names
+            .flatMap((name) => {
+            const match = pattern.exec(name);
+            if (!match)
+                return [];
+            return [
+                {
+                    seq: match[1] ? Number(match[1]) : 0,
+                    path: join(this.rootDir, name),
+                },
+            ];
+        })
+            .sort((a, b) => b.seq - a.seq);
     }
     async #currentBrowserInstanceId() {
         this.#resolvedBrowserInstanceId ||= Promise.resolve(typeof this.#browserInstanceId === "function"
@@ -17494,7 +18302,7 @@ class PageLedgerStore {
             throw error;
         }
         await Promise.all(names
-            .filter((name) => /^space-\d+\.json$/.test(name))
+            .filter((name) => LEDGER_FILE_PATTERN.test(name))
             .map(async (name) => {
             const path = join(this.rootDir, name);
             const metadata = await stat(path).catch(() => undefined);
@@ -17514,24 +18322,55 @@ class PageLedgerStore {
             }
         }));
     }
-    async #writeAtomic(spaceId, ledger) {
-        await mkdir(this.rootDir, { recursive: true, mode: 0o700 });
-        const path = this.#path(spaceId);
-        const temporary = `${path}.${process.pid}.${this.#writeToken}.${++this.#temporarySequence}.tmp`;
+    /**
+     * Read one ledger document. Returns undefined when the file is gone or does
+     * not parse: a version another process is still writing, or one left
+     * truncated by a crash, must not shadow the version before it. A file that
+     * exists but cannot be opened is reported instead, so a reader never
+     * mistakes a locked current version for a missing one.
+     */
+    async #readLedgerJson(path) {
+        let raw;
         try {
-            await writeFile(temporary, `${JSON.stringify(ledger, null, 2)}\n`, {
-                encoding: "utf8",
-                mode: 0o600,
-            });
-            await rename(temporary, path);
+            raw = await this.#read(path);
         }
-        finally {
-            await rm(temporary, { force: true }).catch(() => { });
+        catch (error) {
+            if (error?.code === "ENOENT")
+                return undefined;
+            if (LOCKED_CODES.has(error?.code)) {
+                throw new LedgerLockedError(path, error);
+            }
+            throw error;
+        }
+        try {
+            return JSON.parse(raw);
+        }
+        catch {
+            return undefined;
         }
     }
-    #path(spaceId) {
-        return join(this.rootDir, `space-${spaceId}.json`);
+    #base(spaceId, browserInstanceId) {
+        return join(this.rootDir, `space-${spaceId}${scopeSuffix(browserInstanceId)}`);
     }
+    /** The shared, unnumbered file that SDKs before instance ids wrote. */
+    #legacyPath(spaceId) {
+        return `${this.#base(spaceId)}.json`;
+    }
+}
+function scopeSuffix(browserInstanceId) {
+    return browserInstanceId === undefined
+        ? ""
+        : `@${browserInstanceId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+/** Validate a stored ledger, or return undefined when another browser wrote it. */
+function ownedLedger(value, spaceId, path, browserInstanceId) {
+    const storedBrowserInstanceId = ledgerBrowserInstanceId(value);
+    if (browserInstanceId !== undefined &&
+        storedBrowserInstanceId !== undefined &&
+        storedBrowserInstanceId !== browserInstanceId) {
+        return undefined;
+    }
+    return validateLedger(value, spaceId, path);
 }
 function emptyLedger(spaceId, browserInstanceId) {
     return {
@@ -17692,6 +18531,131 @@ function isRetryableResolutionError(error, pageSessionId) {
         typeof error.sessionId === "string" &&
         error.sessionId !== pageSessionId);
 }
+/** A resolution failure that found nothing to act on, as opposed to a blocked target. */
+function isNoMatchResolutionError(error) {
+    return (error instanceof ElementResolutionError &&
+        error.kind === "transient" &&
+        /matched 0 elements/.test(error.message));
+}
+// Installs one MutationObserver per document on first use and reports the
+// time since the last observed mutation (zero right after installation). The
+// retry loop separately requires a full idle window since the action started.
+const DOM_ACTIVITY_PROBE = `(() => {
+  const key = "__egoBrowserDomActivity";
+  let tracker = window[key];
+  if (!tracker) {
+    tracker = { last: performance.now(), observer: null };
+    try {
+      const observer = new MutationObserver(() => {
+        tracker.last = performance.now();
+      });
+      observer.observe(document.documentElement || document, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+      tracker.observer = observer;
+    } catch (error) {
+      tracker.observer = null;
+    }
+    Object.defineProperty(window, key, {
+      value: tracker,
+      configurable: true,
+      enumerable: false,
+      writable: true,
+    });
+  }
+  let framesLoading = false;
+  for (const frame of document.querySelectorAll("iframe, frame")) {
+    try {
+      const doc = frame.contentDocument;
+      if (doc && doc.readyState !== "complete") framesLoading = true;
+    } catch (error) {
+      // Cross-origin frames are covered by network tracking.
+    }
+  }
+  return {
+    readyState: document.readyState,
+    // Hidden documents run throttled timers, so their quiet is not idleness.
+    visible: document.visibilityState === "visible",
+    idleMs: tracker.observer ? performance.now() - tracker.last : -1,
+    framesLoading,
+  };
+})()`;
+// Records, for one guarded action, whether a click reached a file input in
+// the main document. A capture listener sees trusted clicks, label clicks and
+// scripted clicks on attached inputs (retargeted through shadow roots); a
+// detached input created on the fly only receives its own click, so the
+// prototype methods are wrapped for the duration of the action. Frames have
+// their own documents, so a page with frames reports "unknown".
+const FILE_INPUT_PROBE_INSTALL = `(() => {
+  const key = "__egoBrowserFileInputProbe";
+  const previous = window[key];
+  if (previous) previous.restore();
+  const proto = HTMLInputElement.prototype;
+  const originals = { click: proto.click, showPicker: proto.showPicker };
+  const probe = { seen: false, handler: null, restore: null };
+  const markIfFile = (input) => {
+    if (input instanceof HTMLInputElement && input.type === "file") probe.seen = true;
+  };
+  probe.handler = (event) => {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    markIfFile(path.length > 0 ? path[0] : event.target);
+  };
+  document.addEventListener("click", probe.handler, true);
+  for (const name of Object.keys(originals)) {
+    if (typeof originals[name] !== "function") continue;
+    proto[name] = function (...args) {
+      markIfFile(this);
+      return originals[name].apply(this, args);
+    };
+  }
+  probe.restore = () => {
+    document.removeEventListener("click", probe.handler, true);
+    for (const name of Object.keys(originals)) {
+      if (typeof originals[name] === "function") proto[name] = originals[name];
+    }
+    delete window[key];
+  };
+  Object.defineProperty(window, key, {
+    value: probe,
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
+  return true;
+})()`;
+const FILE_INPUT_PROBE_READ = `(() => {
+  const key = "__egoBrowserFileInputProbe";
+  const probe = window[key];
+  if (!probe) return null;
+  probe.restore();
+  if (probe.seen === true) return true;
+  return document.querySelector("iframe, frame") ? null : false;
+})()`;
+/**
+ * Build the Target.setDiscoverTargets enabler. Browser-level commands are
+ * routed through the selected task space, so discovery is enabled once per
+ * space. A failed or unsupported attempt resolves false and is retried on the
+ * next call.
+ */
+function createTargetDiscoveryEnabler(supported, cdp) {
+    const enabling = new Map();
+    return (spaceId) => {
+        if (!supported())
+            return Promise.resolve(false);
+        let pending = enabling.get(spaceId);
+        if (!pending) {
+            pending = cdp("Target.setDiscoverTargets", { discover: true }).then(() => true, () => {
+                enabling.delete(spaceId);
+                return false;
+            });
+            enabling.set(spaceId, pending);
+        }
+        return pending;
+    };
+}
 class PageEvaluationTimeoutError extends Error {
     code = "EGO_PAGE_EVALUATION_TIMED_OUT";
     timeoutMs;
@@ -17712,7 +18676,43 @@ const PAGE_CLOSE_CONFIRM_INTERVAL_MS = 50;
 const CREATED_SPACE_TAB_TIMEOUT_MS = 2_000;
 const CREATED_SPACE_TAB_POLL_INTERVAL_MS = 50;
 const DEFAULT_PAGE_ACTION_TIMEOUT_MS = 3_000;
-const PAGE_ACTION_RESOLUTION_RETRY_MS = 500;
+// A blocked target (hidden, disabled, covered) is re-examined at this cadence
+// until the action timeout; a short interval lets an element that becomes
+// actionable a few frames later be clicked without waiting most of a second.
+const PAGE_ACTION_RESOLUTION_RETRY_MS = 50;
+// A missing action target stops being retried once the page has shown no DOM
+// mutation and no network activity for this long; a page that is still
+// loading or rendering keeps the full action timeout.
+const MISSING_TARGET_IDLE_MS = 500;
+const MISSING_TARGET_PROBE_TIMEOUT_MS = 1_000;
+// One page round trip after an action orders a popup's Target.targetCreated
+// event ahead of the response, so no settle delay is needed.
+const POPUP_SYNC_TIMEOUT_MS = 1_000;
+const PAGE_UNRESPONSIVE_URL_TIMEOUT_MS = 1_000;
+// Page.stopLoading is answered by the browser process; the frame-tree read
+// afterwards is what shows whether the renderer answers again.
+const PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS = 1_000;
+// The native tab list can lag the CDP target event by a few milliseconds.
+const POPUP_TAB_LIST_RETRIES = 10;
+const POPUP_TAB_LIST_RETRY_MS = 20;
+// Legacy settle for runtimes that cannot deliver Target.* events.
+const POPUP_POLL_SETTLE_MS = 50;
+// After a navigation commits, cross-process iframes are still being created
+// and auto-attached. Enumerating frame sessions in that window can attach a
+// second session to a child and drop its in-flight requests from network
+// tracking (see ensureFrameSessions), so navigation keeps the settle that the
+// previous tab-list diff provided. Input actions do not need it.
+const NAVIGATION_FRAME_SETTLE_MS = 60;
+// A snapshot whose capture straddles a document commit is retried against the
+// new document. Two retries absorb the common "action, then snapshot" race
+// without turning a page that keeps navigating into an unbounded loop.
+const SNAPSHOT_DOCUMENT_CHANGE_RETRIES = 2;
+// A file chooser request can trail the input acknowledgement. When the page
+// reports that the action clicked a file input, wait for the chooser event
+// (it resolves the race early); when the page could not be asked, fall back
+// to the short settle the tab-list diff used to provide.
+const FILE_CHOOSER_OPEN_WAIT_MS = 1_000;
+const FILE_CHOOSER_SETTLE_MS = 50;
 const CONTROL_POLL_INTERVAL_MS = 20_000;
 const PAGE_EVALUATE_EXECUTION_TIMEOUT_MS = 14_000;
 const PAGE_EVALUATE_TRANSPORT_TIMEOUT_MS = 15_000;
@@ -17903,6 +18903,7 @@ const baseDefaultServices = {
     invalidateSession,
     setPreferredTarget,
     supportsBackgroundPageDiscovery: isBrowserRuntime,
+    ensureTargetDiscovery: createTargetDiscoveryEnabler(() => isBrowserRuntime(), (method, params) => browserCdp(method, params)),
     subscribeBrowserEvents,
     subscribePageEvents,
     prepareDownload(targetId, options) {
@@ -18046,9 +19047,7 @@ class TaskSpace {
         // cannot fall into the gap between the initial inventory and the callback.
         try {
             await this.#services.gate.withSpace(this.id, async () => {
-                await this.#services.cdp("Target.setDiscoverTargets", {
-                    discover: true,
-                });
+                await this.#services.ensureTargetDiscovery(this.id);
                 await this.#recoverExistingChildPages();
             });
         }
@@ -18144,10 +19143,20 @@ class TaskSpace {
                 .map(([label]) => label);
             const closedManagedLabelSet = new Set(labelsToClose);
             const keptManagedLabels = Object.keys(ledger.pages).filter((label) => !closedManagedLabelSet.has(label));
-            const preservedUnmanagedCount = tabs.filter((tab) => !managedByTarget.has(tab.targetId)).length;
+            // Unmanaged tabs the SDK opened itself (the blank anchor page.close()
+            // leaves behind) belong to the agent: they are closed, not protected.
+            const agentUnmanagedTargets = tabs
+                .filter((tab) => !managedByTarget.has(tab.targetId) &&
+                ledger.unmanagedTargets[tab.targetId] === "agent")
+                .map((tab) => tab.targetId);
+            const agentUnmanagedSet = new Set(agentUnmanagedTargets);
+            const preservedUnmanagedCount = tabs.filter((tab) => !managedByTarget.has(tab.targetId) &&
+                !agentUnmanagedSet.has(tab.targetId)).length;
             const hasProtectedTabs = tabs.some((tab) => {
                 const managed = managedByTarget.get(tab.targetId);
-                return !managed || managed.openedBy === "unknown";
+                if (managed)
+                    return managed.openedBy === "unknown";
+                return !agentUnmanagedSet.has(tab.targetId);
             });
             if (options.keep !== "all" &&
                 options.keep.length === 0 &&
@@ -18165,6 +19174,7 @@ class TaskSpace {
             for (const label of labelsToClose) {
                 await this.page(label).close();
             }
+            await this.#closeAgentUnmanagedTabs(agentUnmanagedTargets);
             await this.#services.completeTaskSpace();
             await this.#discardTerminalState();
             return {
@@ -18175,6 +19185,33 @@ class TaskSpace {
                 preservedUnmanagedCount,
             };
         });
+    }
+    /**
+     * Close SDK-opened unmanaged tabs (blank anchors) that the space no longer
+     * needs. A tab that is the last one in the space stays: closing it would
+     * destroy the space the caller chose to keep.
+     */
+    async #closeAgentUnmanagedTabs(targetIds) {
+        if (targetIds.length === 0)
+            return;
+        let live = new Set((await this.#services.listTabs()).map((tab) => tab.targetId));
+        for (const targetId of targetIds) {
+            if (!live.has(targetId) || live.size <= 1)
+                continue;
+            const result = await this.#services.cdp("Target.closeTarget", {
+                targetId,
+            });
+            if (result?.success !== true) {
+                throw new Error(`failed to close anchor tab ${targetId}`);
+            }
+            const disappeared = await waitForTargetToDisappear(this.#services, targetId, PAGE_CLOSE_CONFIRM_TIMEOUT_MS);
+            if (!disappeared) {
+                throw new Error(`anchor tab ${targetId} did not close within ${PAGE_CLOSE_CONFIRM_TIMEOUT_MS}ms`);
+            }
+            this.#services.invalidateSession(targetId);
+            this.#services.pageRefs.clear(targetId);
+            live = new Set((await this.#services.listTabs()).map((tab) => tab.targetId));
+        }
     }
     async [rollbackCreatedTaskSpaceToken]() {
         await this.#services.gate.withSpace(this.spaceId, async () => {
@@ -18536,13 +19573,15 @@ class Page {
         const timeoutMs = options.timeout ?? 15_000;
         const waitUntil = options.waitUntil ?? "load";
         const page = await this.#resolve();
+        const deadline = this.#services.now() + timeoutMs;
         const { receipt } = await this.#runActionBoundary(page, async (sessionId) => {
             await navigateInPage(this.#services, sessionId, url, {
                 referer: options.referer,
                 timeoutMs,
                 waitUntil,
+                deadline,
             });
-        });
+        }, { inputAction: false, sessionTimeoutMs: timeoutMs });
         return receipt;
     }
     async reload(options = {}) {
@@ -18550,12 +19589,14 @@ class Page {
         const timeoutMs = options.timeout ?? 15_000;
         const waitUntil = options.waitUntil ?? "load";
         const page = await this.#resolve();
+        const deadline = this.#services.now() + timeoutMs;
         const { receipt } = await this.#runActionBoundary(page, async (sessionId) => {
             await reloadInPage(this.#services, sessionId, {
                 timeoutMs,
                 waitUntil,
+                deadline,
             });
-        });
+        }, { inputAction: false, sessionTimeoutMs: timeoutMs });
         return receipt;
     }
     async snapshot(options = {}) {
@@ -18593,34 +19634,88 @@ class Page {
             }
             const { root: _root, ...snapshotOptions } = options;
             const snapshotScope = options.scope ?? "only_within_viewport";
-            const beforeDocuments = await this.#pageDocuments(page, sessionId);
-            const result = await this.#services.snapshot({
-                ...snapshotOptions,
-                ...(root === undefined ? {} : { root }),
-                scope: snapshotScope,
-                includeActionMarks: options.includeActionMarks ?? true,
-                includeStableLocator: options.includeStableLocator ?? true,
-            });
-            const iframeSessions = Array.isArray(result?.refs) && result.refs.length > 0
-                ? await this.#services.ensureFrameSessions(page.targetId)
-                : new Map();
-            await preparePageSnapshotResult(this.#services, sessionId, iframeSessions, result, rootContext);
-            const documents = await this.#pageDocuments(page, sessionId);
-            for (const ref of result?.refs || []) {
-                const documentId = pageRefDocumentId(ref, documents);
-                if (!documentId ||
-                    documentId !== pageRefDocumentId(ref, beforeDocuments)) {
+            const capture = async () => {
+                const result = await this.#services.snapshot({
+                    ...snapshotOptions,
+                    ...(root === undefined ? {} : { root }),
+                    scope: snapshotScope,
+                    includeActionMarks: options.includeActionMarks ?? true,
+                    includeStableLocator: options.includeStableLocator ?? true,
+                });
+                const iframeSessions = Array.isArray(result?.refs) && result.refs.length > 0
+                    ? await this.#frameSessions(page)
+                    : new Map();
+                await preparePageSnapshotResult(this.#services, sessionId, iframeSessions, result, rootContext);
+                return result;
+            };
+            // An input action that triggers a navigation returns before the new
+            // document commits, so the commit often lands inside the very next
+            // snapshot. A capture that straddles a commit mixes two documents and is
+            // discarded; the documents read after it are the baseline for the retry,
+            // which captures the stable new document in the common case.
+            let documents = await this.#pageDocuments(page, sessionId);
+            let result;
+            for (let attempt = 0;; attempt += 1) {
+                const beforeDocuments = documents;
+                result = await capture();
+                documents = await this.#pageDocuments(page, sessionId);
+                if (rootRefId) {
+                    // The subtree root is a node of the document the refs were taken
+                    // from. Once that document is gone, a retry would capture whatever
+                    // node now carries its backend id, so the root is stale instead.
+                    const registry = this.#services.pageRefs;
+                    registry.invalidateChangedDocuments(page.targetId, documents);
+                    if (registry.isInvalidated(page.targetId, rootRefId)) {
+                        throw new ElementResolutionError(`Stale ref: @${rootRefId}; take a new snapshot`, "permanent");
+                    }
+                }
+                const changed = (result?.refs || []).some((ref) => {
+                    const documentId = pageRefDocumentId(ref, documents);
+                    return (!documentId ||
+                        documentId !== pageRefDocumentId(ref, beforeDocuments));
+                });
+                if (!changed)
+                    break;
+                if (attempt >= SNAPSHOT_DOCUMENT_CHANGE_RETRIES) {
                     throw new ElementResolutionError("Page changed during snapshot; take a new snapshot", "transient");
                 }
-                ref.documentId = documentId;
+            }
+            for (const ref of result?.refs || []) {
+                ref.documentId = pageRefDocumentId(ref, documents);
             }
             await this.#loadRefs(page);
             this.#services.pageRefs.invalidateChangedDocuments(page.targetId, documents);
             await this.#registerSnapshotRefs(page, result, snapshotScope === "full_page");
             const content = result?.content || "";
             const header = await this.#snapshotHeader(page);
-            return `${header}\n${content}`;
+            const overflow = snapshotScope === "only_within_viewport"
+                ? await this.#viewportOverflowHint(sessionId)
+                : "";
+            if (!overflow)
+                return `${header}\n${content}`;
+            // The native content ends with a newline; keep the hint directly below
+            // the last node instead of after a blank line.
+            return `${header}\n${content.replace(/\n+$/, "")}\n${overflow}`;
         });
+    }
+    /**
+     * One trailing line for a viewport snapshot when the document scrolls past
+     * the viewport. The native viewport snapshot silently omits offscreen nodes,
+     * so without this line an agent cannot tell "no result yet" from "the result
+     * is below the fold". Any failure to read the metrics (pending dialog, lost
+     * frame, slow page) degrades to no hint rather than a failed snapshot.
+     */
+    async #viewportOverflowHint(sessionId) {
+        if (this.#services.pendingDialog(sessionId))
+            return "";
+        let metrics;
+        try {
+            metrics = await evaluateInSession(this.#services, sessionId, VIEWPORT_METRICS_EXPRESSION, false, undefined, VIEWPORT_METRICS_TIMEOUT_MS, VIEWPORT_METRICS_TIMEOUT_MS);
+        }
+        catch {
+            return "";
+        }
+        return viewportOverflowHint(metrics);
     }
     async url() {
         return this.#evaluate("location.href", false);
@@ -18894,7 +19989,7 @@ class Page {
         return this.#services.gate.withPage(page, async ({ sessionId }) => {
             await this.#activate(page.targetId);
             const refMap = await this.#refMapForAction(page, sessionId, selector);
-            return waitForSelectorInPage(this.#services, sessionId, refMap, selector, options, (timeoutMs) => this.#services.ensureFrameSessions(page.targetId, timeoutMs));
+            return waitForSelectorInPage(this.#services, sessionId, refMap, selector, options, (timeoutMs) => this.#frameSessions(page, timeoutMs));
         });
     }
     async waitForLoadState(state = "load", options = {}) {
@@ -19039,9 +20134,13 @@ class Page {
                 throw new Error(`page ${this.label} was closed`);
             }
             if (tabs.length <= 1) {
+                // Ego Lite destroys a task space when its last tab closes, so open a
+                // blank anchor first. It is SDK-owned: recording it as an agent-origin
+                // unmanaged tab keeps reconcile from adopting it as a managed Page and
+                // lets finish() close it instead of protecting it as a user tab.
                 const anchorTargetId = await this.#services.createTab("about:blank");
                 try {
-                    await this.#services.ledger.keepUnmanaged(this.spaceId, anchorTargetId, "unknown");
+                    await this.#services.ledger.keepUnmanaged(this.spaceId, anchorTargetId, "agent");
                 }
                 catch (error) {
                     // The original page is still live, so a failed anchor bookkeeping
@@ -19108,19 +20207,63 @@ class Page {
         const selectors = Array.isArray(selector) ? selector : [selector];
         const timeoutMs = options.timeout ?? DEFAULT_PAGE_ACTION_TIMEOUT_MS;
         const actionName = options.actionName ?? "page action";
-        const { receipt } = await this.#runActionBoundary(page, (sessionId) => this.#retryElementAction(actionName, timeoutMs, sessionId, (remainingMs) => this.#resolveActionTargets(page, sessionId, remainingMs, ...selectors), ({ refMap, iframeSessions }, services) => operation(sessionId, refMap, iframeSessions, services)), options.guardFileChooser);
+        const { receipt } = await this.#runActionBoundary(page, (sessionId) => this.#retryElementAction(actionName, timeoutMs, sessionId, (remainingMs) => this.#resolveActionTargets(page, sessionId, remainingMs, ...selectors), ({ refMap, iframeSessions }, services) => operation(sessionId, refMap, iframeSessions, services)), { guardFileChooser: options.guardFileChooser });
         return receipt;
     }
     async #resolveActionTargets(page, sessionId, remainingMs, ...selectors) {
         const refMap = await this.#refMapForAction(page, sessionId, ...selectors);
-        const iframeSessions = await this.#services.ensureFrameSessions(page.targetId, Math.max(1, remainingMs));
+        const iframeSessions = await this.#frameSessions(page, Math.max(1, remainingMs));
         return { refMap, iframeSessions };
     }
-    /** Services whose CDP transport reports the first `Input.*` command. */
-    #inputTrackingServices(onInput) {
+    /**
+     * Report how long the page has been idle when an action target is missing.
+     * Returns null while the page is still loading, mutating, fetching, or
+     * hidden (throttled timers), or when the runtime cannot observe network
+     * activity, so the action keeps waiting for its full timeout in every
+     * uncertain case.
+     */
+    async #idleWithoutTarget(sessionId) {
+        let sessions;
+        try {
+            sessions = await this.#services.pageNetworkSessions(sessionId, MISSING_TARGET_PROBE_TIMEOUT_MS);
+        }
+        catch {
+            return null;
+        }
+        const network = this.#services.networkActivity(sessions);
+        if (!network.tracking || network.inflight > 0)
+            return null;
+        if (this.#services.now() - network.lastActivityAt <
+            MISSING_TARGET_IDLE_MS) {
+            return null;
+        }
+        let probe;
+        try {
+            const response = await this.#services.cdp("Runtime.evaluate", { expression: DOM_ACTIVITY_PROBE, returnByValue: true }, sessionId, MISSING_TARGET_PROBE_TIMEOUT_MS);
+            probe = runtimeValue(response, DOM_ACTIVITY_PROBE);
+        }
+        catch {
+            return null;
+        }
+        if (!probe ||
+            probe.readyState !== "complete" ||
+            !probe.visible ||
+            probe.framesLoading ||
+            typeof probe.idleMs !== "number" ||
+            probe.idleMs < MISSING_TARGET_IDLE_MS) {
+            return null;
+        }
+        return { idleMs: Math.round(probe.idleMs) };
+    }
+    /**
+     * Services whose CDP transport reports the first `Input.*` command and
+     * which carry the action deadline into the driver's scroll loops.
+     */
+    #inputTrackingServices(deadline, onInput) {
         const services = this.#services;
         return {
             ...services,
+            actionDeadline: deadline,
             cdp(method, params, sessionId, timeoutMs) {
                 if (method.startsWith("Input."))
                     onInput();
@@ -19136,11 +20279,12 @@ class Page {
      * already reached the page is never dispatched twice.
      */
     async #retryElementAction(actionName, timeoutMs, pageSessionId, prepare, perform) {
-        const deadline = this.#services.now() + timeoutMs;
+        const startedAt = this.#services.now();
+        const deadline = startedAt + timeoutMs;
         let lastBlocker;
         while (true) {
             let inputDispatched = false;
-            const services = this.#inputTrackingServices(() => {
+            const services = this.#inputTrackingServices(deadline, () => {
                 inputDispatched = true;
             });
             try {
@@ -19160,9 +20304,27 @@ class Page {
                     : isRetryableResolutionError(error, pageSessionId);
                 if (!retryable && !exhausted)
                     throw error;
+                // Idle time counts from this action's start, not from the page's
+                // last mutation: work started by the previous action may not have
+                // touched the DOM yet, so the first attempt never gives up early.
+                if (!inputDispatched &&
+                    isNoMatchResolutionError(error) &&
+                    this.#services.now() - startedAt >= MISSING_TARGET_IDLE_MS) {
+                    const idle = await this.#idleWithoutTarget(pageSessionId);
+                    if (idle) {
+                        throw new ElementResolutionError(`${actionName} failed: ${error.message}. The page has been idle ` +
+                            `for ${idle.idleMs}ms with no DOM changes and no network ` +
+                            `requests in flight, so the target is not about to appear. ` +
+                            `Check the selector against a fresh snapshot, or use ` +
+                            `page.waitForSelector() when the element is expected later.`, "permanent");
+                    }
+                }
                 if (remainingMs <= 0) {
                     const blocker = exhausted && lastBlocker ? lastBlocker : error;
-                    throw new ElementResolutionError(`${actionName} timed out after ${timeoutMs}ms: ${blocker.message}`, "transient");
+                    // Report the time the action really took: a slow page can overrun
+                    // the configured timeout, and the configured value is the caller's.
+                    const elapsedMs = this.#services.now() - startedAt;
+                    throw new ElementResolutionError(`${actionName} timed out after ${elapsedMs}ms: ${blocker.message}`, "transient");
                 }
                 lastBlocker = error;
                 await this.#services.sleep(Math.min(PAGE_ACTION_RESOLUTION_RETRY_MS, remainingMs));
@@ -19185,7 +20347,9 @@ class Page {
     }
     async #runObservedAction(operation) {
         const page = await this.#resolve();
-        const { receipt } = await this.#runActionBoundary(page, operation, true);
+        const { receipt } = await this.#runActionBoundary(page, operation, {
+            guardFileChooser: true,
+        });
         return receipt;
     }
     async #handleJavaScriptDialog(accept, promptText) {
@@ -19214,7 +20378,10 @@ class Page {
             return operation(sessionId);
         });
     }
-    async #runActionBoundary(page, operation, guardFileChooser = false) {
+    async #runActionBoundary(page, operation, { guardFileChooser = false, 
+    // Navigation already waits on page lifecycle; only input actions need
+    // the ordering round trip to see a popup created by the input itself.
+    inputAction = true, sessionTimeoutMs, } = {}) {
         const explicitDownload = this.#pendingDownload;
         const armedDownload = explicitDownload
             ? await explicitDownload.arm
@@ -19240,9 +20407,12 @@ class Page {
                     cancel: true,
                 })
                 : undefined;
+            const popupWatch = await this.#watchPopups(inputAction);
             try {
                 await fileChooserGuard?.ready;
-                const before = new Set((await this.#services.listTabs()).map((tab) => tab.targetId));
+                const fileInputProbe = fileChooserGuard
+                    ? await this.#installFileInputProbe(sessionId)
+                    : false;
                 let actionError;
                 let value;
                 try {
@@ -19258,24 +20428,29 @@ class Page {
                         receipt: { dialog },
                     };
                 }
-                // A popup is normally created synchronously by the input event. A short
-                // settle covers native tab-list propagation without turning this into a
-                // navigation wait or silently changing the page's active state.
-                await this.#services.sleep(50);
+                if (!inputAction) {
+                    await this.#services.sleep(NAVIGATION_FRAME_SETTLE_MS);
+                }
                 let popupError;
-                const popups = [];
+                let popups = [];
                 try {
-                    const after = await this.#services.listTabs();
-                    for (const tab of after) {
-                        if (before.has(tab.targetId))
-                            continue;
-                        const managed = await this.#services.ledger.addPage(this.spaceId, tab.targetId, { openedBy: "agent" });
-                        recordDiscoveredPage(this.spaceId, managed, this.label, tab.url);
-                        popups.push({ label: managed.label, targetId: managed.targetId });
-                    }
+                    popups = await popupWatch.collect(sessionId);
                 }
                 catch (error) {
                     popupError = error;
+                }
+                if (fileChooserGuard && !fileChooserGuard.peek()) {
+                    const clickedFileInput = fileInputProbe
+                        ? await this.#readFileInputProbe(sessionId)
+                        : null;
+                    if (clickedFileInput !== false) {
+                        await Promise.race([
+                            fileChooserGuard.event.catch(() => { }),
+                            this.#services.sleep(clickedFileInput
+                                ? FILE_CHOOSER_OPEN_WAIT_MS
+                                : FILE_CHOOSER_SETTLE_MS),
+                        ]);
+                    }
                 }
                 if (fileChooserGuard?.peek()) {
                     throw unhandledFileChooserError();
@@ -19290,9 +20465,208 @@ class Page {
                 };
             }
             finally {
+                popupWatch.dispose();
                 await fileChooserGuard?.dispose();
             }
+        }, { sessionTimeoutMs });
+    }
+    /**
+     * Start observing popups for one action. With target discovery the watch
+     * records Target.targetCreated events and costs nothing when no popup
+     * opens; without it the watch falls back to diffing the tab list.
+     */
+    async #watchPopups(inputAction) {
+        const discovering = await this.#services.ensureTargetDiscovery(this.spaceId);
+        if (!discovering)
+            return this.#pollingPopupWatch();
+        const created = new Map();
+        const stop = this.#services.subscribeBrowserEvents((event) => {
+            const info = event?.params?.targetInfo;
+            if (event?.method !== "Target.targetCreated" ||
+                info?.type !== "page" ||
+                typeof info.targetId !== "string") {
+                return;
+            }
+            created.set(info.targetId, typeof info.url === "string" ? info.url : "");
         });
+        return {
+            dispose: stop,
+            collect: async (sessionId) => {
+                if (created.size === 0 && inputAction) {
+                    // A popup opened by the input is created by the browser before this
+                    // page answers any later command, so one round trip delivers its
+                    // Target.targetCreated event ahead of the response.
+                    await this.#syncWithPage(sessionId);
+                }
+                if (created.size === 0)
+                    return [];
+                return this.#adoptCreatedPopups(created);
+            },
+        };
+    }
+    async #pollingPopupWatch() {
+        const before = new Set((await this.#services.listTabs()).map((tab) => tab.targetId));
+        return {
+            dispose: () => { },
+            collect: async () => {
+                // A popup is normally created synchronously by the input event. A short
+                // settle covers native tab-list propagation without turning this into a
+                // navigation wait or silently changing the page's active state.
+                await this.#services.sleep(POPUP_POLL_SETTLE_MS);
+                const created = new Map();
+                for (const tab of await this.#services.listTabs()) {
+                    if (!before.has(tab.targetId))
+                        created.set(tab.targetId, tab.url);
+                }
+                if (created.size === 0)
+                    return [];
+                return this.#adoptCreatedPopups(created);
+            },
+        };
+    }
+    /** Returns true when the main document accepted the file-input click probe. */
+    async #installFileInputProbe(sessionId) {
+        try {
+            const response = await this.#services.cdp("Runtime.evaluate", { expression: FILE_INPUT_PROBE_INSTALL, returnByValue: true }, sessionId, POPUP_SYNC_TIMEOUT_MS);
+            return runtimeValue(response, FILE_INPUT_PROBE_INSTALL) === true;
+        }
+        catch {
+            return false;
+        }
+    }
+    /** Returns whether a click reached a file input, or null when unknown. */
+    async #readFileInputProbe(sessionId) {
+        try {
+            const response = await this.#services.cdp("Runtime.evaluate", { expression: FILE_INPUT_PROBE_READ, returnByValue: true }, sessionId, POPUP_SYNC_TIMEOUT_MS);
+            const value = runtimeValue(response, FILE_INPUT_PROBE_READ);
+            return typeof value === "boolean" ? value : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    async #syncWithPage(sessionId) {
+        try {
+            await this.#services.cdp("Runtime.evaluate", { expression: "0", returnByValue: true }, sessionId, POPUP_SYNC_TIMEOUT_MS);
+        }
+        catch {
+            // A navigating or dialog-blocked page cannot answer; the popup, if any,
+            // is adopted by background discovery or the next task.tabs().
+        }
+    }
+    async #adoptCreatedPopups(created) {
+        // Target discovery is browser-wide; the tab list scopes it to this space.
+        let tabs = await this.#services.listTabs();
+        for (let attempt = 0; attempt < POPUP_TAB_LIST_RETRIES; attempt += 1) {
+            const known = new Set(tabs.map((tab) => tab.targetId));
+            if ([...created.keys()].every((targetId) => known.has(targetId)))
+                break;
+            await this.#services.sleep(POPUP_TAB_LIST_RETRY_MS);
+            tabs = await this.#services.listTabs();
+        }
+        const popups = [];
+        for (const [targetId, eventUrl] of created) {
+            const tab = tabs.find((candidate) => candidate.targetId === targetId);
+            if (!tab)
+                continue;
+            const url = tab.url || eventUrl;
+            try {
+                const managed = await this.#services.ledger.addPage(this.spaceId, targetId, { openedBy: "agent" });
+                recordDiscoveredPage(this.spaceId, managed, this.label, url);
+                popups.push({ label: managed.label, targetId: managed.targetId });
+            }
+            catch (error) {
+                // Background discovery may have adopted the same target first.
+                const label = typeof this.#services.ledger.read === "function"
+                    ? labelForTarget(await this.#services.ledger.read(this.spaceId), targetId)
+                    : undefined;
+                if (!label)
+                    throw error;
+                popups.push({ label, targetId });
+            }
+        }
+        return popups;
+    }
+    /**
+     * Frame discovery for this Page. Every call site goes through here so an
+     * unresponsive Page is always reported with its label and recovery steps,
+     * whichever step of an operation first ran into it.
+     */
+    async #frameSessions(page, timeoutMs) {
+        try {
+            return await this.#services.ensureFrameSessions(page.targetId, timeoutMs);
+        }
+        catch (error) {
+            if (!isPageUnresponsiveError(error))
+                throw error;
+            throw await this.#describeUnresponsivePage(error, page);
+        }
+    }
+    /**
+     * Replace the runtime's generic "did not answer" error with one that names
+     * this Page and what happened next. The wait that just ran out was this
+     * call's whole budget, so a main-frame navigation that did not commit in it
+     * is stopped here, as goto does at its own timeout: the Page then answers
+     * again instead of costing every later call another full wait. Thrown from
+     * here so the stack shows the public call instead of a transport timer.
+     */
+    async #describeUnresponsivePage(error, page) {
+        let url;
+        try {
+            // The browser process answers Target.* on its own, so this cannot stall.
+            // Its URL may already show the pending navigation, so do not call it
+            // the committed one.
+            const response = await this.#services.cdp("Target.getTargetInfo", { targetId: page.targetId }, undefined, PAGE_UNRESPONSIVE_URL_TIMEOUT_MS);
+            const info = response?.result?.targetInfo || response?.targetInfo;
+            if (typeof info?.url === "string" && info.url.length > 0)
+                url = info.url;
+        }
+        catch {
+            // The URL is a courtesy; the error stands without it.
+        }
+        const recovered = error.sessionId
+            ? await this.#stopPendingNavigation(error.sessionId)
+            : "unknown";
+        const described = new PageUnresponsiveError(error.method, error.waitedMs, page.targetId, error.sessionId);
+        const head = `Page ${this.label}${url ? ` (${url})` : ""} did not answer ${error.method} within ${error.waitedMs}ms`;
+        if (recovered === "hung") {
+            described.message = `${head}, and still did not answer after Page.stopLoading, so its renderer is probably hung. Continue on a new Page from task.newPage(), or close this Page and open it again.`;
+        }
+        else if (recovered === "unknown") {
+            described.message =
+                `${head}. ` +
+                    "Chromium suspends every renderer command while a main-frame navigation has started but not committed, and a hung renderer behaves the same way. " +
+                    'Retry once the pending navigation commits, call page.goto(url, { timeout }) with a longer timeout, stop the pending navigation with page.cdp("Page.stopLoading"), or continue on a new Page from task.newPage().';
+        }
+        else {
+            described.stopped = true;
+            described.currentUrl = recovered.url;
+            described.message =
+                `${head}: a main-frame navigation had started but not committed. ` +
+                    `It was stopped once that wait ran out, so the Page answers again${recovered.url ? ` and shows ${recovered.url}` : ""}. ` +
+                    "Retry the call to continue on that document; to load the pending one, call page.goto(url, { timeout }) with a longer timeout, or continue on a new Page from task.newPage().";
+        }
+        return described;
+    }
+    /**
+     * Stop whatever main-frame navigation keeps this Page from answering and
+     * read its main frame once it does. "hung" means the Page still answers
+     * nothing: a hung renderer, which Page.stopLoading cannot help.
+     */
+    async #stopPendingNavigation(sessionId) {
+        try {
+            await this.#services.cdp("Page.stopLoading", {}, sessionId, PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS);
+            const response = await this.#services.cdp("Page.getFrameTree", {}, sessionId, PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS);
+            const frame = response?.result?.frameTree?.frame || response?.frameTree?.frame;
+            return {
+                ...(typeof frame?.url === "string" && frame.url.length > 0
+                    ? { url: frame.url }
+                    : {}),
+            };
+        }
+        catch {
+            return "hung";
+        }
     }
     async #refMapForAction(page, sessionId, ...selectors) {
         if (!selectors.some((selector) => parseRef(selector))) {
@@ -19317,7 +20691,7 @@ class Page {
         return refs;
     }
     async #pageDocuments(page, sessionId) {
-        const iframeSessions = await this.#services.ensureFrameSessions(page.targetId);
+        const iframeSessions = await this.#frameSessions(page);
         const readTree = async (session) => {
             const response = await this.#services.cdp("Page.getFrameTree", {}, session);
             return (response.result || response).frameTree;
@@ -19405,6 +20779,34 @@ class Page {
         await this.#services.cdp("Target.activateTarget", { targetId });
         this.#services.setPreferredTarget(targetId);
     }
+}
+const VIEWPORT_METRICS_TIMEOUT_MS = 2_000;
+// Keep the field names distinct from page.info() so test doubles and log
+// readers can tell the two reads apart.
+const VIEWPORT_METRICS_EXPRESSION = "({viewportHeight:innerHeight,scrollY:scrollY,pageHeight:document.documentElement.scrollHeight})";
+/**
+ * Describe scrollable content outside the viewport, or return "" when the
+ * viewport already shows the whole document. Sub-pixel differences from
+ * fractional layout are ignored so a page that fits never gets a hint.
+ */
+function viewportOverflowHint(metrics) {
+    if (!metrics || typeof metrics !== "object")
+        return "";
+    const { viewportHeight, scrollY, pageHeight } = metrics;
+    if (!Number.isFinite(viewportHeight) ||
+        !Number.isFinite(scrollY) ||
+        !Number.isFinite(pageHeight)) {
+        return "";
+    }
+    const top = Math.round(scrollY);
+    const viewport = Math.round(viewportHeight);
+    const page = Math.round(pageHeight);
+    const above = top > 1;
+    const below = page - (top + viewport) > 1;
+    if (!above && !below)
+        return "";
+    const where = above && below ? "above and below" : above ? "above" : "below";
+    return `[more content ${where} the viewport: scrollY=${top}, viewport ${viewport} / page ${page} px; scroll or use snapshot({ scope: "full_page" })]`;
 }
 function pageSnapshotOptionsError(message) {
     const signature = publicApiEntry("Page.snapshot")?.signature;
@@ -20356,7 +21758,10 @@ async function claimResolvedTaskSpace(space, op = "claimTaskSpace") {
         throw new Error(`${op} requires ego.claimTaskSpace`);
     }
     const id = taskSpaceNumericId(space, op);
-    const claimed = normalizeTaskSpace(await invokeEgo(op, () => ego.claimTaskSpace(id, space.name)));
+    const claimed = normalizeTaskSpace(
+    // An empty name would rename the Space while claiming it; omit it so an
+    // unnamed user Space keeps its UI placeholder.
+    await invokeEgo(op, () => space.name ? ego.claimTaskSpace(id, space.name) : ego.claimTaskSpace(id)));
     if (!claimed) {
         throw new Error(`${op} returned an invalid task space`);
     }
@@ -20528,16 +21933,17 @@ function normalizeTaskSpaces(raw) {
     }
     throw new Error("listTaskSpaces expected { taskSpaces: [...] }");
 }
+// `id` is the native locator. `name` and `taskId` are display values and are
+// empty for a user Space that was never renamed, so they must not gate entries.
 function normalizeTaskSpace(space) {
-    const taskId = space?.taskId ?? space?.name ?? space?.id;
-    if (taskId === undefined || taskId === null || taskId === "") {
+    if (space?.id === undefined || space?.id === null) {
         return null;
     }
+    const name = space.name ?? space.taskId ?? "";
     return {
         ...space,
-        taskId,
-        id: space?.id ?? taskId,
-        name: space?.name ?? taskId,
+        taskId: space.taskId ?? name,
+        name,
     };
 }
 function taskSpaceNumericId(space, op) {

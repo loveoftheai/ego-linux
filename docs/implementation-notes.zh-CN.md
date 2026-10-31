@@ -147,3 +147,64 @@ Node 进程"一致）：
 - `keyboard.paste` 的 macOS/Windows 原生粘贴路径在 Linux 用 CDP 输入模拟。
 - `animationHighlightMouseToPosition` 用 overlay 窗口实现（待做）。
 - 更新机制不用 Keystone，用自有通道（待定）。
+
+## 2026-10-31：同步上游 v2.2.0-beta.5（93 commits，origin/main..v2.2.0-beta.5）
+
+上游行为变化（只列影响本 port 的；其余为测试/文档/CI）：
+- page-ledger：账本文件改为版本化（`space-<id>@<instance>.<n>.json`，最高可解析版
+  本为准，不再 rename 覆盖；被占用的版本重试后报错、永不顶替）、锁定版本读重试
+  （EPERM/EACCES/EBUSY，约 1.8s）、写冲突重试（上限 8 次）、旧版共享文件迁移、
+  账本按浏览器实例隔离（实例 id 经 `scopeSuffix` 清洗，`:` → `-`）。
+- 导航停止：goto/reload 超时未提交则停止导航、Page 保持在旧文档可用；其它调用
+  在待定导航上等一 bounded 期后以 `EGO_PAGE_UNRESPONSIVE` 失败并停止该导航，
+  错误说明当前文档与如何加载待定文档；会话建立等待有界且会点名无响应 Page。
+- 点击快速路径：actionability 检查合并为一次注入调用，v1 click 探针失败时交给
+  共享 resolver；强制点击跳过 hit test 但仍拒绝 disabled 元素。
+- snapshot：默认 viewport 快照在文档超出视口时末尾追加
+  `[more content above/below the viewport: ...]` 提示行（读不到度量时静默无提示）；
+  跨文档提交的 snapshot 捕获重试；陈旧 subtree root 直接报错不再重试。
+- 截图：默认截图路径按 run 隔离（tmpdir + 随机 6 位后缀，不再是 pid+序号）；
+  `globalThis.EGO_BROWSER_OUTPUT_DIR` 必须为绝对路径，否则抛错。
+- finish()：关闭最后一个 Page 时留下的空白 anchor tab 会被关闭，不再被当作
+  用户 tab 阻断 `finish({ keep: [] })`。
+- 下载：下载等待标记在等待中刷新、被拒绝的 arming 会话可恢复、进程重置期间
+  arming 的下载设置会重应用；多 Page/进程共享一个 guid 命名的下载目录
+  （`runtimeStateDir()/downloads`，CDP `Page.setDownloadBehavior`）。
+- Worker：自动 attach 的非 frame target 全部 resume 后 detach（此前只有 iframe 与
+  dedicated worker 被允许，AudioWorklet 会被挂起）；每 Page 会话启用 Ego automation hooks。
+- Skill：指南升到 v2.2.0（2026-10-16），按平台分段渲染（`SKILL.md` 全量 +
+  `SKILL.macos.md` / `SKILL.windows.md`），新增 install-macos/install-windows 指南；
+  插件 npm 包改走 `@ego-lite` scope（本 port 不发 npm 包，只同步 skill 内容）。
+- 公共 API 无新增方法（schema 只改了 goto/reload/actionTimeout 的说明文字）；
+  上游原生绑定面（`ego.*`）与旧版集合完全一致。
+
+本 port 的改动：
+- `vendor/ego-browser/dist/`（out + src + scripts）与
+  `vendor/ego-browser/skill-body/SKILL.md` 从 beta.5 源码重建并同步（相对旧 bundle：
+  20 个文件变化 + 新增 install-macos.md、install-windows.md、SKILL.macos.md、
+  SKILL.windows.md；SDK package 版本仍为 0.1.0）。
+- Linux port patch 未被上游取代、已重打到 beta.5：上游实例隔离只决定账本文件
+  按“给定的实例 id”分文件，`runtimeInstanceId()` 本身仍是 ppid 推导；port 的
+  nodejs 每次调用是新进程、ppid 不稳定，故 `EGO_BROWSER_INSTANCE_ID` 优先分支
+  仍需保留（与旧 patch 逐字相同，见 beta.5 工作树源码；构建产物已含该分支）。
+- `~/.agents/skills/ego-browser` 已按 port 自有认领规则刷新（旧安装与旧 bundle
+  字节一致 → adopted+refreshed，并写入 `.ego-linux-managed` 标记）。
+- `src/*.js` 绑定层、launcher CLI 表面均无需改动：上游新增行为全部走 SDK bundle
+  内 + CDP 转发；`claimTaskSpace(id)` 无名调用、实例 id 字符集、截图/下载路径等
+  均已逐项核对兼容。
+- VERSION：`0.6.0.16-linux.2`（package.json 同步）。
+
+验证（2026-10-31，日志见 `/tmp/e2e-3r-beta5-stdout.txt`、
+`/tmp/e2e-snapshot16-beta5.log`、`/tmp/e2e-obs-beta5.log`、
+`/tmp/e2e-bonus-beta5.log`）：
+- `--version` → `0.6.0.16-linux.2`；`skill --sdk-path vendor/...` → v2.2.0 指南。
+- e2e-3r（goto→snapshot→fill→click→evaluate）PASS。
+- 快照 16 case：首次运行 15/16，唯一失败 observation helpers 是选 case 时漏了
+  前置 case environment initialization（空间未创建）；补跑含前置 case 后
+  observation helpers 通过（51 assertions），实际 16/16。
+- 追加行为 case 10 个全过：pending navigation ×2、默认截图路径 ×2、workers ×4、
+  download lifecycle、actionability。
+- 注意：默认路径 `skill` 仍打印旧 v2.1.0 指南，因为默认 `sdk/` 符号链接指向的
+  旧 repo 产物未动；发布前须把 `sdk/` 物化为新 vendor bundle（见 README 布局节）。
+- 另见：`[ego-browser:notice]` 更新提示在 e2e 输出中出现，属旧有行为（repo
+  FETCH_HEAD 领先于本地 port 提交，updateAvailable 为真），与 beta.5 无关。

@@ -9,6 +9,8 @@ import {
   ensureFrameSessions,
   invalidateSession,
   isCdpRequestTimeoutError,
+  isPageUnresponsiveError,
+  PageUnresponsiveError,
   isBrowserRuntime,
   isPageDialogOpenedError,
   isSessionLostError,
@@ -100,6 +102,115 @@ function isRetryableResolutionError(error, pageSessionId) {
   }
   return isSessionLostError(error) && typeof error.sessionId === "string" && error.sessionId !== pageSessionId;
 }
+function isNoMatchResolutionError(error) {
+  return error instanceof ElementResolutionError && error.kind === "transient" && /matched 0 elements/.test(error.message);
+}
+const DOM_ACTIVITY_PROBE = `(() => {
+  const key = "__egoBrowserDomActivity";
+  let tracker = window[key];
+  if (!tracker) {
+    tracker = { last: performance.now(), observer: null };
+    try {
+      const observer = new MutationObserver(() => {
+        tracker.last = performance.now();
+      });
+      observer.observe(document.documentElement || document, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+      tracker.observer = observer;
+    } catch (error) {
+      tracker.observer = null;
+    }
+    Object.defineProperty(window, key, {
+      value: tracker,
+      configurable: true,
+      enumerable: false,
+      writable: true,
+    });
+  }
+  let framesLoading = false;
+  for (const frame of document.querySelectorAll("iframe, frame")) {
+    try {
+      const doc = frame.contentDocument;
+      if (doc && doc.readyState !== "complete") framesLoading = true;
+    } catch (error) {
+      // Cross-origin frames are covered by network tracking.
+    }
+  }
+  return {
+    readyState: document.readyState,
+    // Hidden documents run throttled timers, so their quiet is not idleness.
+    visible: document.visibilityState === "visible",
+    idleMs: tracker.observer ? performance.now() - tracker.last : -1,
+    framesLoading,
+  };
+})()`;
+const FILE_INPUT_PROBE_INSTALL = `(() => {
+  const key = "__egoBrowserFileInputProbe";
+  const previous = window[key];
+  if (previous) previous.restore();
+  const proto = HTMLInputElement.prototype;
+  const originals = { click: proto.click, showPicker: proto.showPicker };
+  const probe = { seen: false, handler: null, restore: null };
+  const markIfFile = (input) => {
+    if (input instanceof HTMLInputElement && input.type === "file") probe.seen = true;
+  };
+  probe.handler = (event) => {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    markIfFile(path.length > 0 ? path[0] : event.target);
+  };
+  document.addEventListener("click", probe.handler, true);
+  for (const name of Object.keys(originals)) {
+    if (typeof originals[name] !== "function") continue;
+    proto[name] = function (...args) {
+      markIfFile(this);
+      return originals[name].apply(this, args);
+    };
+  }
+  probe.restore = () => {
+    document.removeEventListener("click", probe.handler, true);
+    for (const name of Object.keys(originals)) {
+      if (typeof originals[name] === "function") proto[name] = originals[name];
+    }
+    delete window[key];
+  };
+  Object.defineProperty(window, key, {
+    value: probe,
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
+  return true;
+})()`;
+const FILE_INPUT_PROBE_READ = `(() => {
+  const key = "__egoBrowserFileInputProbe";
+  const probe = window[key];
+  if (!probe) return null;
+  probe.restore();
+  if (probe.seen === true) return true;
+  return document.querySelector("iframe, frame") ? null : false;
+})()`;
+function createTargetDiscoveryEnabler(supported, cdp) {
+  const enabling = /* @__PURE__ */ new Map();
+  return (spaceId) => {
+    if (!supported()) return Promise.resolve(false);
+    let pending = enabling.get(spaceId);
+    if (!pending) {
+      pending = cdp("Target.setDiscoverTargets", { discover: true }).then(
+        () => true,
+        () => {
+          enabling.delete(spaceId);
+          return false;
+        }
+      );
+      enabling.set(spaceId, pending);
+    }
+    return pending;
+  };
+}
 class PageEvaluationTimeoutError extends Error {
   code = "EGO_PAGE_EVALUATION_TIMED_OUT";
   timeoutMs;
@@ -125,7 +236,19 @@ const PAGE_CLOSE_CONFIRM_INTERVAL_MS = 50;
 const CREATED_SPACE_TAB_TIMEOUT_MS = 2e3;
 const CREATED_SPACE_TAB_POLL_INTERVAL_MS = 50;
 const DEFAULT_PAGE_ACTION_TIMEOUT_MS = 3e3;
-const PAGE_ACTION_RESOLUTION_RETRY_MS = 500;
+const PAGE_ACTION_RESOLUTION_RETRY_MS = 50;
+const MISSING_TARGET_IDLE_MS = 500;
+const MISSING_TARGET_PROBE_TIMEOUT_MS = 1e3;
+const POPUP_SYNC_TIMEOUT_MS = 1e3;
+const PAGE_UNRESPONSIVE_URL_TIMEOUT_MS = 1e3;
+const PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS = 1e3;
+const POPUP_TAB_LIST_RETRIES = 10;
+const POPUP_TAB_LIST_RETRY_MS = 20;
+const POPUP_POLL_SETTLE_MS = 50;
+const NAVIGATION_FRAME_SETTLE_MS = 60;
+const SNAPSHOT_DOCUMENT_CHANGE_RETRIES = 2;
+const FILE_CHOOSER_OPEN_WAIT_MS = 1e3;
+const FILE_CHOOSER_SETTLE_MS = 50;
 const CONTROL_POLL_INTERVAL_MS = 2e4;
 const PAGE_EVALUATE_EXECUTION_TIMEOUT_MS = 14e3;
 const PAGE_EVALUATE_TRANSPORT_TIMEOUT_MS = 15e3;
@@ -370,6 +493,10 @@ const baseDefaultServices = {
   invalidateSession,
   setPreferredTarget,
   supportsBackgroundPageDiscovery: isBrowserRuntime,
+  ensureTargetDiscovery: createTargetDiscoveryEnabler(
+    () => isBrowserRuntime(),
+    (method, params) => browserCdp(method, params)
+  ),
   subscribeBrowserEvents,
   subscribePageEvents,
   prepareDownload(targetId, options) {
@@ -510,9 +637,7 @@ class TaskSpace {
     });
     try {
       await this.#services.gate.withSpace(this.id, async () => {
-        await this.#services.cdp("Target.setDiscoverTargets", {
-          discover: true
-        });
+        await this.#services.ensureTargetDiscovery(this.id);
         await this.#recoverExistingChildPages();
       });
     } catch {
@@ -612,12 +737,17 @@ class TaskSpace {
       const keptManagedLabels = Object.keys(ledger.pages).filter(
         (label) => !closedManagedLabelSet.has(label)
       );
+      const agentUnmanagedTargets = tabs.filter(
+        (tab) => !managedByTarget.has(tab.targetId) && ledger.unmanagedTargets[tab.targetId] === "agent"
+      ).map((tab) => tab.targetId);
+      const agentUnmanagedSet = new Set(agentUnmanagedTargets);
       const preservedUnmanagedCount = tabs.filter(
-        (tab) => !managedByTarget.has(tab.targetId)
+        (tab) => !managedByTarget.has(tab.targetId) && !agentUnmanagedSet.has(tab.targetId)
       ).length;
       const hasProtectedTabs = tabs.some((tab) => {
         const managed = managedByTarget.get(tab.targetId);
-        return !managed || managed.openedBy === "unknown";
+        if (managed) return managed.openedBy === "unknown";
+        return !agentUnmanagedSet.has(tab.targetId);
       });
       if (options.keep !== "all" && options.keep.length === 0 && !hasProtectedTabs) {
         await this.#services.closeTaskSpace();
@@ -633,6 +763,7 @@ class TaskSpace {
       for (const label of labelsToClose) {
         await this.page(label).close();
       }
+      await this.#closeAgentUnmanagedTabs(agentUnmanagedTargets);
       await this.#services.completeTaskSpace();
       await this.#discardTerminalState();
       return {
@@ -643,6 +774,41 @@ class TaskSpace {
         preservedUnmanagedCount
       };
     });
+  }
+  /**
+   * Close SDK-opened unmanaged tabs (blank anchors) that the space no longer
+   * needs. A tab that is the last one in the space stays: closing it would
+   * destroy the space the caller chose to keep.
+   */
+  async #closeAgentUnmanagedTabs(targetIds) {
+    if (targetIds.length === 0) return;
+    let live = new Set(
+      (await this.#services.listTabs()).map((tab) => tab.targetId)
+    );
+    for (const targetId of targetIds) {
+      if (!live.has(targetId) || live.size <= 1) continue;
+      const result = await this.#services.cdp("Target.closeTarget", {
+        targetId
+      });
+      if (result?.success !== true) {
+        throw new Error(`failed to close anchor tab ${targetId}`);
+      }
+      const disappeared = await waitForTargetToDisappear(
+        this.#services,
+        targetId,
+        PAGE_CLOSE_CONFIRM_TIMEOUT_MS
+      );
+      if (!disappeared) {
+        throw new Error(
+          `anchor tab ${targetId} did not close within ${PAGE_CLOSE_CONFIRM_TIMEOUT_MS}ms`
+        );
+      }
+      this.#services.invalidateSession(targetId);
+      this.#services.pageRefs.clear(targetId);
+      live = new Set(
+        (await this.#services.listTabs()).map((tab) => tab.targetId)
+      );
+    }
   }
   async [rollbackCreatedTaskSpaceToken]() {
     await this.#services.gate.withSpace(this.spaceId, async () => {
@@ -1039,15 +1205,18 @@ class Page {
     const timeoutMs = options.timeout ?? 15e3;
     const waitUntil = options.waitUntil ?? "load";
     const page = await this.#resolve();
+    const deadline = this.#services.now() + timeoutMs;
     const { receipt } = await this.#runActionBoundary(
       page,
       async (sessionId) => {
         await navigateInPage(this.#services, sessionId, url, {
           referer: options.referer,
           timeoutMs,
-          waitUntil
+          waitUntil,
+          deadline
         });
-      }
+      },
+      { inputAction: false, sessionTimeoutMs: timeoutMs }
     );
     return receipt;
   }
@@ -1056,14 +1225,17 @@ class Page {
     const timeoutMs = options.timeout ?? 15e3;
     const waitUntil = options.waitUntil ?? "load";
     const page = await this.#resolve();
+    const deadline = this.#services.now() + timeoutMs;
     const { receipt } = await this.#runActionBoundary(
       page,
       async (sessionId) => {
         await reloadInPage(this.#services, sessionId, {
           timeoutMs,
-          waitUntil
+          waitUntil,
+          deadline
         });
-      }
+      },
+      { inputAction: false, sessionTimeoutMs: timeoutMs }
     );
     return receipt;
   }
@@ -1111,32 +1283,54 @@ class Page {
       }
       const { root: _root, ...snapshotOptions } = options;
       const snapshotScope = options.scope ?? "only_within_viewport";
-      const beforeDocuments = await this.#pageDocuments(page, sessionId);
-      const result = await this.#services.snapshot({
-        ...snapshotOptions,
-        ...root === void 0 ? {} : { root },
-        scope: snapshotScope,
-        includeActionMarks: options.includeActionMarks ?? true,
-        includeStableLocator: options.includeStableLocator ?? true
-      });
-      const iframeSessions = Array.isArray(result?.refs) && result.refs.length > 0 ? await this.#services.ensureFrameSessions(page.targetId) : /* @__PURE__ */ new Map();
-      await preparePageSnapshotResult(
-        this.#services,
-        sessionId,
-        iframeSessions,
-        result,
-        rootContext
-      );
-      const documents = await this.#pageDocuments(page, sessionId);
-      for (const ref of result?.refs || []) {
-        const documentId = pageRefDocumentId(ref, documents);
-        if (!documentId || documentId !== pageRefDocumentId(ref, beforeDocuments)) {
+      const capture = async () => {
+        const result2 = await this.#services.snapshot({
+          ...snapshotOptions,
+          ...root === void 0 ? {} : { root },
+          scope: snapshotScope,
+          includeActionMarks: options.includeActionMarks ?? true,
+          includeStableLocator: options.includeStableLocator ?? true
+        });
+        const iframeSessions = Array.isArray(result2?.refs) && result2.refs.length > 0 ? await this.#frameSessions(page) : /* @__PURE__ */ new Map();
+        await preparePageSnapshotResult(
+          this.#services,
+          sessionId,
+          iframeSessions,
+          result2,
+          rootContext
+        );
+        return result2;
+      };
+      let documents = await this.#pageDocuments(page, sessionId);
+      let result;
+      for (let attempt = 0; ; attempt += 1) {
+        const beforeDocuments = documents;
+        result = await capture();
+        documents = await this.#pageDocuments(page, sessionId);
+        if (rootRefId) {
+          const registry = this.#services.pageRefs;
+          registry.invalidateChangedDocuments(page.targetId, documents);
+          if (registry.isInvalidated(page.targetId, rootRefId)) {
+            throw new ElementResolutionError(
+              `Stale ref: @${rootRefId}; take a new snapshot`,
+              "permanent"
+            );
+          }
+        }
+        const changed = (result?.refs || []).some((ref) => {
+          const documentId = pageRefDocumentId(ref, documents);
+          return !documentId || documentId !== pageRefDocumentId(ref, beforeDocuments);
+        });
+        if (!changed) break;
+        if (attempt >= SNAPSHOT_DOCUMENT_CHANGE_RETRIES) {
           throw new ElementResolutionError(
             "Page changed during snapshot; take a new snapshot",
             "transient"
           );
         }
-        ref.documentId = documentId;
+      }
+      for (const ref of result?.refs || []) {
+        ref.documentId = pageRefDocumentId(ref, documents);
       }
       await this.#loadRefs(page);
       this.#services.pageRefs.invalidateChangedDocuments(
@@ -1150,9 +1344,38 @@ class Page {
       );
       const content = result?.content || "";
       const header = await this.#snapshotHeader(page);
-      return `${header}
+      const overflow = snapshotScope === "only_within_viewport" ? await this.#viewportOverflowHint(sessionId) : "";
+      if (!overflow) return `${header}
 ${content}`;
+      return `${header}
+${content.replace(/\n+$/, "")}
+${overflow}`;
     });
+  }
+  /**
+   * One trailing line for a viewport snapshot when the document scrolls past
+   * the viewport. The native viewport snapshot silently omits offscreen nodes,
+   * so without this line an agent cannot tell "no result yet" from "the result
+   * is below the fold". Any failure to read the metrics (pending dialog, lost
+   * frame, slow page) degrades to no hint rather than a failed snapshot.
+   */
+  async #viewportOverflowHint(sessionId) {
+    if (this.#services.pendingDialog(sessionId)) return "";
+    let metrics;
+    try {
+      metrics = await evaluateInSession(
+        this.#services,
+        sessionId,
+        VIEWPORT_METRICS_EXPRESSION,
+        false,
+        void 0,
+        VIEWPORT_METRICS_TIMEOUT_MS,
+        VIEWPORT_METRICS_TIMEOUT_MS
+      );
+    } catch {
+      return "";
+    }
+    return viewportOverflowHint(metrics);
   }
   async url() {
     return this.#evaluate("location.href", false);
@@ -1460,7 +1683,7 @@ ${content}`;
         refMap,
         selector,
         options,
-        (timeoutMs) => this.#services.ensureFrameSessions(page.targetId, timeoutMs)
+        (timeoutMs) => this.#frameSessions(page, timeoutMs)
       );
     });
   }
@@ -1710,7 +1933,7 @@ ${content}`;
           await this.#services.ledger.keepUnmanaged(
             this.spaceId,
             anchorTargetId,
-            "unknown"
+            "agent"
           );
         } catch (error) {
           await this.#services.cdp("Target.closeTarget", { targetId: anchorTargetId }).catch(() => {
@@ -1809,23 +2032,66 @@ ${content}`;
         ),
         ({ refMap, iframeSessions }, services) => operation(sessionId, refMap, iframeSessions, services)
       ),
-      options.guardFileChooser
+      { guardFileChooser: options.guardFileChooser }
     );
     return receipt;
   }
   async #resolveActionTargets(page, sessionId, remainingMs, ...selectors) {
     const refMap = await this.#refMapForAction(page, sessionId, ...selectors);
-    const iframeSessions = await this.#services.ensureFrameSessions(
-      page.targetId,
+    const iframeSessions = await this.#frameSessions(
+      page,
       Math.max(1, remainingMs)
     );
     return { refMap, iframeSessions };
   }
-  /** Services whose CDP transport reports the first `Input.*` command. */
-  #inputTrackingServices(onInput) {
+  /**
+   * Report how long the page has been idle when an action target is missing.
+   * Returns null while the page is still loading, mutating, fetching, or
+   * hidden (throttled timers), or when the runtime cannot observe network
+   * activity, so the action keeps waiting for its full timeout in every
+   * uncertain case.
+   */
+  async #idleWithoutTarget(sessionId) {
+    let sessions;
+    try {
+      sessions = await this.#services.pageNetworkSessions(
+        sessionId,
+        MISSING_TARGET_PROBE_TIMEOUT_MS
+      );
+    } catch {
+      return null;
+    }
+    const network = this.#services.networkActivity(sessions);
+    if (!network.tracking || network.inflight > 0) return null;
+    if (this.#services.now() - network.lastActivityAt < MISSING_TARGET_IDLE_MS) {
+      return null;
+    }
+    let probe;
+    try {
+      const response = await this.#services.cdp(
+        "Runtime.evaluate",
+        { expression: DOM_ACTIVITY_PROBE, returnByValue: true },
+        sessionId,
+        MISSING_TARGET_PROBE_TIMEOUT_MS
+      );
+      probe = runtimeValue(response, DOM_ACTIVITY_PROBE);
+    } catch {
+      return null;
+    }
+    if (!probe || probe.readyState !== "complete" || !probe.visible || probe.framesLoading || typeof probe.idleMs !== "number" || probe.idleMs < MISSING_TARGET_IDLE_MS) {
+      return null;
+    }
+    return { idleMs: Math.round(probe.idleMs) };
+  }
+  /**
+   * Services whose CDP transport reports the first `Input.*` command and
+   * which carry the action deadline into the driver's scroll loops.
+   */
+  #inputTrackingServices(deadline, onInput) {
     const services = this.#services;
     return {
       ...services,
+      actionDeadline: deadline,
       cdp(method, params, sessionId, timeoutMs) {
         if (method.startsWith("Input.")) onInput();
         return services.cdp(method, params, sessionId, timeoutMs);
@@ -1840,11 +2106,12 @@ ${content}`;
    * already reached the page is never dispatched twice.
    */
   async #retryElementAction(actionName, timeoutMs, pageSessionId, prepare, perform) {
-    const deadline = this.#services.now() + timeoutMs;
+    const startedAt = this.#services.now();
+    const deadline = startedAt + timeoutMs;
     let lastBlocker;
     while (true) {
       let inputDispatched = false;
-      const services = this.#inputTrackingServices(() => {
+      const services = this.#inputTrackingServices(deadline, () => {
         inputDispatched = true;
       });
       try {
@@ -1855,10 +2122,20 @@ ${content}`;
         const exhausted = !inputDispatched && isCdpRequestTimeoutError(error) && remainingMs <= 0;
         const retryable = inputDispatched ? isRetryableElementStateError(error) : isRetryableResolutionError(error, pageSessionId);
         if (!retryable && !exhausted) throw error;
+        if (!inputDispatched && isNoMatchResolutionError(error) && this.#services.now() - startedAt >= MISSING_TARGET_IDLE_MS) {
+          const idle = await this.#idleWithoutTarget(pageSessionId);
+          if (idle) {
+            throw new ElementResolutionError(
+              `${actionName} failed: ${error.message}. The page has been idle for ${idle.idleMs}ms with no DOM changes and no network requests in flight, so the target is not about to appear. Check the selector against a fresh snapshot, or use page.waitForSelector() when the element is expected later.`,
+              "permanent"
+            );
+          }
+        }
         if (remainingMs <= 0) {
           const blocker = exhausted && lastBlocker ? lastBlocker : error;
+          const elapsedMs = this.#services.now() - startedAt;
           throw new ElementResolutionError(
-            `${actionName} timed out after ${timeoutMs}ms: ${blocker.message}`,
+            `${actionName} timed out after ${elapsedMs}ms: ${blocker.message}`,
             "transient"
           );
         }
@@ -1880,7 +2157,9 @@ ${content}`;
   }
   async #runObservedAction(operation) {
     const page = await this.#resolve();
-    const { receipt } = await this.#runActionBoundary(page, operation, true);
+    const { receipt } = await this.#runActionBoundary(page, operation, {
+      guardFileChooser: true
+    });
     return receipt;
   }
   async #handleJavaScriptDialog(accept, promptText) {
@@ -1909,7 +2188,13 @@ ${content}`;
       return operation(sessionId);
     });
   }
-  async #runActionBoundary(page, operation, guardFileChooser = false) {
+  async #runActionBoundary(page, operation, {
+    guardFileChooser = false,
+    // Navigation already waits on page lifecycle; only input actions need
+    // the ordering round trip to see a popup created by the input itself.
+    inputAction = true,
+    sessionTimeoutMs
+  } = {}) {
     const explicitDownload = this.#pendingDownload;
     const armedDownload = explicitDownload ? await explicitDownload.arm : void 0;
     if (armedDownload && armedDownload.page.targetId !== page.targetId) {
@@ -1922,63 +2207,270 @@ ${content}`;
         throw new Error("file chooser waiter belongs to a different Page");
       }
     }
-    return this.#services.gate.withPage(page, async ({ sessionId }) => {
-      await this.#activate(page.targetId);
-      await armedDownload?.interception.ready(sessionId);
-      const fileChooserGuard = guardFileChooser && !explicitFileChooser ? this.#services.prepareFileChooser(sessionId, {
-        timeoutMs: 1e3,
-        cancel: true
-      }) : void 0;
-      try {
-        await fileChooserGuard?.ready;
-        const before = new Set(
-          (await this.#services.listTabs()).map((tab) => tab.targetId)
-        );
-        let actionError;
-        let value;
+    return this.#services.gate.withPage(
+      page,
+      async ({ sessionId }) => {
+        await this.#activate(page.targetId);
+        await armedDownload?.interception.ready(sessionId);
+        const fileChooserGuard = guardFileChooser && !explicitFileChooser ? this.#services.prepareFileChooser(sessionId, {
+          timeoutMs: 1e3,
+          cancel: true
+        }) : void 0;
+        const popupWatch = await this.#watchPopups(inputAction);
         try {
-          value = await operation(sessionId);
-        } catch (error) {
-          actionError = error;
-        }
-        if (isPageDialogOpenedError(actionError)) {
-          const dialog = this.#services.pendingDialog(sessionId) || actionError.dialog;
-          return {
-            value: void 0,
-            receipt: { dialog }
-          };
-        }
-        await this.#services.sleep(50);
-        let popupError;
-        const popups = [];
-        try {
-          const after = await this.#services.listTabs();
-          for (const tab of after) {
-            if (before.has(tab.targetId)) continue;
-            const managed = await this.#services.ledger.addPage(
-              this.spaceId,
-              tab.targetId,
-              { openedBy: "agent" }
-            );
-            recordDiscoveredPage(this.spaceId, managed, this.label, tab.url);
-            popups.push({ label: managed.label, targetId: managed.targetId });
+          await fileChooserGuard?.ready;
+          const fileInputProbe = fileChooserGuard ? await this.#installFileInputProbe(sessionId) : false;
+          let actionError;
+          let value;
+          try {
+            value = await operation(sessionId);
+          } catch (error) {
+            actionError = error;
           }
-        } catch (error) {
-          popupError = error;
+          if (isPageDialogOpenedError(actionError)) {
+            const dialog = this.#services.pendingDialog(sessionId) || actionError.dialog;
+            return {
+              value: void 0,
+              receipt: { dialog }
+            };
+          }
+          if (!inputAction) {
+            await this.#services.sleep(NAVIGATION_FRAME_SETTLE_MS);
+          }
+          let popupError;
+          let popups = [];
+          try {
+            popups = await popupWatch.collect(sessionId);
+          } catch (error) {
+            popupError = error;
+          }
+          if (fileChooserGuard && !fileChooserGuard.peek()) {
+            const clickedFileInput = fileInputProbe ? await this.#readFileInputProbe(sessionId) : null;
+            if (clickedFileInput !== false) {
+              await Promise.race([
+                fileChooserGuard.event.catch(() => {
+                }),
+                this.#services.sleep(
+                  clickedFileInput ? FILE_CHOOSER_OPEN_WAIT_MS : FILE_CHOOSER_SETTLE_MS
+                )
+              ]);
+            }
+          }
+          if (fileChooserGuard?.peek()) {
+            throw unhandledFileChooserError();
+          }
+          if (actionError) throw actionError;
+          if (popupError) throw popupError;
+          return {
+            value,
+            receipt: popups.length > 0 ? { popups } : {}
+          };
+        } finally {
+          popupWatch.dispose();
+          await fileChooserGuard?.dispose();
         }
-        if (fileChooserGuard?.peek()) {
-          throw unhandledFileChooserError();
-        }
-        if (actionError) throw actionError;
-        if (popupError) throw popupError;
-        return {
-          value,
-          receipt: popups.length > 0 ? { popups } : {}
-        };
-      } finally {
-        await fileChooserGuard?.dispose();
+      },
+      { sessionTimeoutMs }
+    );
+  }
+  /**
+   * Start observing popups for one action. With target discovery the watch
+   * records Target.targetCreated events and costs nothing when no popup
+   * opens; without it the watch falls back to diffing the tab list.
+   */
+  async #watchPopups(inputAction) {
+    const discovering = await this.#services.ensureTargetDiscovery(
+      this.spaceId
+    );
+    if (!discovering) return this.#pollingPopupWatch();
+    const created = /* @__PURE__ */ new Map();
+    const stop = this.#services.subscribeBrowserEvents((event) => {
+      const info = event?.params?.targetInfo;
+      if (event?.method !== "Target.targetCreated" || info?.type !== "page" || typeof info.targetId !== "string") {
+        return;
       }
+      created.set(info.targetId, typeof info.url === "string" ? info.url : "");
     });
+    return {
+      dispose: stop,
+      collect: async (sessionId) => {
+        if (created.size === 0 && inputAction) {
+          await this.#syncWithPage(sessionId);
+        }
+        if (created.size === 0) return [];
+        return this.#adoptCreatedPopups(created);
+      }
+    };
+  }
+  async #pollingPopupWatch() {
+    const before = new Set(
+      (await this.#services.listTabs()).map((tab) => tab.targetId)
+    );
+    return {
+      dispose: () => {
+      },
+      collect: async () => {
+        await this.#services.sleep(POPUP_POLL_SETTLE_MS);
+        const created = /* @__PURE__ */ new Map();
+        for (const tab of await this.#services.listTabs()) {
+          if (!before.has(tab.targetId)) created.set(tab.targetId, tab.url);
+        }
+        if (created.size === 0) return [];
+        return this.#adoptCreatedPopups(created);
+      }
+    };
+  }
+  /** Returns true when the main document accepted the file-input click probe. */
+  async #installFileInputProbe(sessionId) {
+    try {
+      const response = await this.#services.cdp(
+        "Runtime.evaluate",
+        { expression: FILE_INPUT_PROBE_INSTALL, returnByValue: true },
+        sessionId,
+        POPUP_SYNC_TIMEOUT_MS
+      );
+      return runtimeValue(response, FILE_INPUT_PROBE_INSTALL) === true;
+    } catch {
+      return false;
+    }
+  }
+  /** Returns whether a click reached a file input, or null when unknown. */
+  async #readFileInputProbe(sessionId) {
+    try {
+      const response = await this.#services.cdp(
+        "Runtime.evaluate",
+        { expression: FILE_INPUT_PROBE_READ, returnByValue: true },
+        sessionId,
+        POPUP_SYNC_TIMEOUT_MS
+      );
+      const value = runtimeValue(response, FILE_INPUT_PROBE_READ);
+      return typeof value === "boolean" ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  async #syncWithPage(sessionId) {
+    try {
+      await this.#services.cdp(
+        "Runtime.evaluate",
+        { expression: "0", returnByValue: true },
+        sessionId,
+        POPUP_SYNC_TIMEOUT_MS
+      );
+    } catch {
+    }
+  }
+  async #adoptCreatedPopups(created) {
+    let tabs = await this.#services.listTabs();
+    for (let attempt = 0; attempt < POPUP_TAB_LIST_RETRIES; attempt += 1) {
+      const known = new Set(tabs.map((tab) => tab.targetId));
+      if ([...created.keys()].every((targetId) => known.has(targetId))) break;
+      await this.#services.sleep(POPUP_TAB_LIST_RETRY_MS);
+      tabs = await this.#services.listTabs();
+    }
+    const popups = [];
+    for (const [targetId, eventUrl] of created) {
+      const tab = tabs.find((candidate) => candidate.targetId === targetId);
+      if (!tab) continue;
+      const url = tab.url || eventUrl;
+      try {
+        const managed = await this.#services.ledger.addPage(
+          this.spaceId,
+          targetId,
+          { openedBy: "agent" }
+        );
+        recordDiscoveredPage(this.spaceId, managed, this.label, url);
+        popups.push({ label: managed.label, targetId: managed.targetId });
+      } catch (error) {
+        const label = typeof this.#services.ledger.read === "function" ? labelForTarget(
+          await this.#services.ledger.read(this.spaceId),
+          targetId
+        ) : void 0;
+        if (!label) throw error;
+        popups.push({ label, targetId });
+      }
+    }
+    return popups;
+  }
+  /**
+   * Frame discovery for this Page. Every call site goes through here so an
+   * unresponsive Page is always reported with its label and recovery steps,
+   * whichever step of an operation first ran into it.
+   */
+  async #frameSessions(page, timeoutMs) {
+    try {
+      return await this.#services.ensureFrameSessions(page.targetId, timeoutMs);
+    } catch (error) {
+      if (!isPageUnresponsiveError(error)) throw error;
+      throw await this.#describeUnresponsivePage(error, page);
+    }
+  }
+  /**
+   * Replace the runtime's generic "did not answer" error with one that names
+   * this Page and what happened next. The wait that just ran out was this
+   * call's whole budget, so a main-frame navigation that did not commit in it
+   * is stopped here, as goto does at its own timeout: the Page then answers
+   * again instead of costing every later call another full wait. Thrown from
+   * here so the stack shows the public call instead of a transport timer.
+   */
+  async #describeUnresponsivePage(error, page) {
+    let url;
+    try {
+      const response = await this.#services.cdp(
+        "Target.getTargetInfo",
+        { targetId: page.targetId },
+        void 0,
+        PAGE_UNRESPONSIVE_URL_TIMEOUT_MS
+      );
+      const info = response?.result?.targetInfo || response?.targetInfo;
+      if (typeof info?.url === "string" && info.url.length > 0) url = info.url;
+    } catch {
+    }
+    const recovered = error.sessionId ? await this.#stopPendingNavigation(error.sessionId) : "unknown";
+    const described = new PageUnresponsiveError(
+      error.method,
+      error.waitedMs,
+      page.targetId,
+      error.sessionId
+    );
+    const head = `Page ${this.label}${url ? ` (${url})` : ""} did not answer ${error.method} within ${error.waitedMs}ms`;
+    if (recovered === "hung") {
+      described.message = `${head}, and still did not answer after Page.stopLoading, so its renderer is probably hung. Continue on a new Page from task.newPage(), or close this Page and open it again.`;
+    } else if (recovered === "unknown") {
+      described.message = `${head}. Chromium suspends every renderer command while a main-frame navigation has started but not committed, and a hung renderer behaves the same way. Retry once the pending navigation commits, call page.goto(url, { timeout }) with a longer timeout, stop the pending navigation with page.cdp("Page.stopLoading"), or continue on a new Page from task.newPage().`;
+    } else {
+      described.stopped = true;
+      described.currentUrl = recovered.url;
+      described.message = `${head}: a main-frame navigation had started but not committed. It was stopped once that wait ran out, so the Page answers again${recovered.url ? ` and shows ${recovered.url}` : ""}. Retry the call to continue on that document; to load the pending one, call page.goto(url, { timeout }) with a longer timeout, or continue on a new Page from task.newPage().`;
+    }
+    return described;
+  }
+  /**
+   * Stop whatever main-frame navigation keeps this Page from answering and
+   * read its main frame once it does. "hung" means the Page still answers
+   * nothing: a hung renderer, which Page.stopLoading cannot help.
+   */
+  async #stopPendingNavigation(sessionId) {
+    try {
+      await this.#services.cdp(
+        "Page.stopLoading",
+        {},
+        sessionId,
+        PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS
+      );
+      const response = await this.#services.cdp(
+        "Page.getFrameTree",
+        {},
+        sessionId,
+        PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS
+      );
+      const frame = response?.result?.frameTree?.frame || response?.frameTree?.frame;
+      return {
+        ...typeof frame?.url === "string" && frame.url.length > 0 ? { url: frame.url } : {}
+      };
+    } catch {
+      return "hung";
+    }
   }
   async #refMapForAction(page, sessionId, ...selectors) {
     if (!selectors.some((selector) => parseRef(selector))) {
@@ -2011,9 +2503,7 @@ ${content}`;
     return refs;
   }
   async #pageDocuments(page, sessionId) {
-    const iframeSessions = await this.#services.ensureFrameSessions(
-      page.targetId
-    );
+    const iframeSessions = await this.#frameSessions(page);
     const readTree = async (session) => {
       const response = await this.#services.cdp(
         "Page.getFrameTree",
@@ -2113,6 +2603,23 @@ ${content}`;
     await this.#services.cdp("Target.activateTarget", { targetId });
     this.#services.setPreferredTarget(targetId);
   }
+}
+const VIEWPORT_METRICS_TIMEOUT_MS = 2e3;
+const VIEWPORT_METRICS_EXPRESSION = "({viewportHeight:innerHeight,scrollY:scrollY,pageHeight:document.documentElement.scrollHeight})";
+function viewportOverflowHint(metrics) {
+  if (!metrics || typeof metrics !== "object") return "";
+  const { viewportHeight, scrollY, pageHeight } = metrics;
+  if (!Number.isFinite(viewportHeight) || !Number.isFinite(scrollY) || !Number.isFinite(pageHeight)) {
+    return "";
+  }
+  const top = Math.round(scrollY);
+  const viewport = Math.round(viewportHeight);
+  const page = Math.round(pageHeight);
+  const above = top > 1;
+  const below = page - (top + viewport) > 1;
+  if (!above && !below) return "";
+  const where = above && below ? "above and below" : above ? "above" : "below";
+  return `[more content ${where} the viewport: scrollY=${top}, viewport ${viewport} / page ${page} px; scroll or use snapshot({ scope: "full_page" })]`;
 }
 function pageSnapshotOptionsError(message) {
   const signature = publicApiEntry("Page.snapshot")?.signature;
@@ -2615,5 +3122,6 @@ export {
   captureTaskSpaceUserBoundary,
   createTaskSpaceHandle,
   initializeTaskSpaceHandle,
-  rollbackCreatedTaskSpace
+  rollbackCreatedTaskSpace,
+  viewportOverflowHint
 };

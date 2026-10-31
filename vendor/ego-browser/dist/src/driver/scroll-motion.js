@@ -8,6 +8,7 @@ async function dispatchWheelMotion(services, motion) {
   let emittedX = 0;
   let emittedY = 0;
   for (let step = 1; step <= steps; step += 1) {
+    if (step > 1 && services.exhausted?.()) return false;
     const progress = step / steps;
     const eased = progress * progress * (3 - 2 * progress);
     const cumulativeX = step === steps ? motion.deltaX : motion.deltaX * eased;
@@ -26,6 +27,7 @@ async function dispatchWheelMotion(services, motion) {
     });
     if (step < steps) await services.sleep(STEP_INTERVAL_MS);
   }
+  return true;
 }
 export {
   dispatchWheelMotion

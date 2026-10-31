@@ -1,19 +1,35 @@
-import { randomUUID } from "node:crypto";
 import {
   mkdir,
   readFile,
   readdir,
-  rename,
   rm,
   stat,
   writeFile
 } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { runtimeStateDir } from "./env.js";
 import {
   validatePageRefState
 } from "./page-ref-registry.js";
 const DEFAULT_STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1e3;
+const MAX_WRITE_CONFLICTS = 8;
+const LEDGER_FILE_PATTERN = /^space-\d+(@[A-Za-z0-9_-]+)?(\.\d+)?\.json$/;
+const LOCKED_CODES = /* @__PURE__ */ new Set(["EPERM", "EACCES", "EBUSY"]);
+const LOCKED_READ_ATTEMPTS = 10;
+const LOCKED_READ_BASE_MS = 20;
+const LOCKED_READ_MAX_MS = 250;
+class LedgerWriteConflict extends Error {
+}
+class LedgerLockedError extends Error {
+  constructor(path, cause) {
+    super(
+      `cannot read page ledger ${path}: ${cause.message}. Another process holds the file open; the ledger was left unchanged`,
+      { cause }
+    );
+    this.name = "LedgerLockedError";
+  }
+}
 function runtimeInstanceId(parentPid = process.ppid) {
   const fromEnv = process.env.EGO_BROWSER_INSTANCE_ID;
   if (fromEnv !== void 0 && fromEnv.length > 0) return fromEnv;
@@ -21,18 +37,22 @@ function runtimeInstanceId(parentPid = process.ppid) {
 }
 class PageLedgerStore {
   rootDir;
-  #writeToken = randomUUID();
   #browserInstanceId;
   #staleAfterMs;
   #now;
-  #temporarySequence = 0;
+  #remove;
+  #read;
+  #sleep;
   #resolvedBrowserInstanceId;
   #cleanup;
   constructor(options = {}) {
-    this.rootDir = options.rootDir || process.env.EGO_BROWSER_STATE_DIR || join(homedir(), ".ego-browser", "state");
+    this.rootDir = options.rootDir || runtimeStateDir();
     this.#browserInstanceId = options.browserInstanceId;
     this.#staleAfterMs = options.staleAfterMs === void 0 ? DEFAULT_STALE_AFTER_MS : options.staleAfterMs;
     this.#now = options.now || Date.now;
+    this.#remove = options.remove || ((path) => rm(path, { force: true }));
+    this.#read = options.read || ((path) => readFile(path, "utf8"));
+    this.#sleep = options.sleep || sleep;
     if (!Number.isFinite(this.#staleAfterMs) || this.#staleAfterMs < 0) {
       throw new TypeError("staleAfterMs must be a non-negative number");
     }
@@ -54,13 +74,18 @@ class PageLedgerStore {
     ledger.initialized = true;
     ledger.usedLabels.push(label);
     ledger.pages[label] = entry;
-    await this.#writeAtomic(spaceId, ledger);
+    await this.#writeLatest(spaceId, ledger);
     return { label, ...entry };
   }
-  /** Remove all Page-model state after its task space is finished or closed. */
+  /**
+   * Remove all Page-model state after its task space is finished or closed.
+   * A version that another process still holds open stays behind; it is
+   * expired like any other stale ledger.
+   */
   async discard(spaceId) {
     assertSpaceId(spaceId);
-    await rm(this.#path(spaceId), { force: true });
+    const browserInstanceId = await this.#currentBrowserInstanceId();
+    await this.#removeAll(await this.#listVersions(spaceId, browserInstanceId));
   }
   async getPage(spaceId, label) {
     assertLabel(label);
@@ -244,40 +269,137 @@ class PageLedgerStore {
   }
   async #update(spaceId, mutate) {
     assertSpaceId(spaceId);
-    const next = await this.#readCurrent(spaceId);
-    mutate(next);
-    await this.#writeAtomic(spaceId, next);
-    return cloneLedger(next);
+    for (let conflicts = 0; ; conflicts++) {
+      const { ledger, files } = await this.#load(spaceId);
+      mutate(ledger);
+      try {
+        await this.#write(spaceId, ledger, files);
+        return cloneLedger(ledger);
+      } catch (error) {
+        if (!(error instanceof LedgerWriteConflict) || conflicts >= MAX_WRITE_CONFLICTS) {
+          throw error;
+        }
+      }
+    }
   }
   async #readCurrent(spaceId) {
+    return (await this.#load(spaceId)).ledger;
+  }
+  /**
+   * The current ledger plus every version file it was chosen from. A version
+   * held open by another process is retried with backoff, then reported.
+   */
+  async #load(spaceId) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.#loadOnce(spaceId);
+      } catch (error) {
+        if (!(error instanceof LedgerLockedError) || attempt >= LOCKED_READ_ATTEMPTS) {
+          throw error;
+        }
+        await this.#sleep(
+          Math.min(LOCKED_READ_BASE_MS * 2 ** attempt, LOCKED_READ_MAX_MS)
+        );
+      }
+    }
+  }
+  async #loadOnce(spaceId) {
     const browserInstanceId = await this.#currentBrowserInstanceId();
     await this.#cleanupExpiredLedgers(browserInstanceId);
-    const path = this.#path(spaceId);
-    let raw;
+    const files = await this.#listVersions(spaceId, browserInstanceId);
+    for (const file of files) {
+      const stored = await this.#readLedgerJson(file.path);
+      if (stored === void 0) continue;
+      return {
+        ledger: ownedLedger(stored, spaceId, file.path, browserInstanceId) || emptyLedger(spaceId, browserInstanceId),
+        files
+      };
+    }
+    if (browserInstanceId === void 0 || files.length > 0) {
+      return { ledger: emptyLedger(spaceId, browserInstanceId), files };
+    }
+    const legacyPath = this.#legacyPath(spaceId);
+    const legacy = await this.#readLedgerJson(legacyPath);
+    const ledger = legacy === void 0 ? void 0 : ownedLedger(legacy, spaceId, legacyPath, browserInstanceId);
+    if (!ledger) {
+      return { ledger: emptyLedger(spaceId, browserInstanceId), files };
+    }
+    ledger.browserInstanceId = browserInstanceId;
+    const written = await this.#writeLatest(spaceId, ledger);
+    await this.#remove(legacyPath).catch(() => {
+    });
+    return { ledger, files: written };
+  }
+  /** Write `ledger` as the next version, whatever versions exist right now. */
+  async #writeLatest(spaceId, ledger) {
+    const browserInstanceId = await this.#currentBrowserInstanceId();
+    for (let conflicts = 0; ; conflicts++) {
+      const files = await this.#listVersions(spaceId, browserInstanceId);
+      try {
+        return await this.#write(spaceId, ledger, files);
+      } catch (error) {
+        if (!(error instanceof LedgerWriteConflict) || conflicts >= MAX_WRITE_CONFLICTS) {
+          throw error;
+        }
+      }
+    }
+  }
+  /**
+   * Create the version after `files` (the listing the ledger was loaded
+   * from), then remove those superseded versions. Another writer that got
+   * there first raises LedgerWriteConflict so the caller reloads instead of
+   * overwriting its update.
+   */
+  async #write(spaceId, ledger, files) {
+    await mkdir(this.rootDir, { recursive: true, mode: 448 });
+    const seq = (files[0]?.seq ?? 0) + 1;
+    const path = `${this.#base(spaceId, await this.#currentBrowserInstanceId())}.${seq}.json`;
     try {
-      raw = await readFile(path, "utf8");
+      await writeFile(path, `${JSON.stringify(ledger, null, 2)}
+`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 384
+      });
     } catch (error) {
-      if (error?.code === "ENOENT") {
-        return emptyLedger(spaceId, browserInstanceId);
+      if (error?.code === "EEXIST") {
+        throw new LedgerWriteConflict(
+          `page ledger ${path} was written concurrently`
+        );
       }
       throw error;
     }
-    let parsed;
+    await this.#removeAll(files);
+    return [{ seq, path }];
+  }
+  /** Best-effort removal: a version held open elsewhere is left behind. */
+  async #removeAll(files) {
+    await Promise.all(
+      files.map((file) => this.#remove(file.path).catch(() => {
+      }))
+    );
+  }
+  /** Every version of one space's ledger, newest first; the unnumbered legacy file is version 0. */
+  async #listVersions(spaceId, browserInstanceId) {
+    let names;
     try {
-      parsed = JSON.parse(raw);
+      names = await readdir(this.rootDir);
     } catch (error) {
-      throw new Error(`invalid page ledger ${path}: ${error.message}`);
+      if (error?.code === "ENOENT") return [];
+      throw error;
     }
-    const storedBrowserInstanceId = ledgerBrowserInstanceId(parsed);
-    if (browserInstanceId !== void 0 && storedBrowserInstanceId !== void 0 && storedBrowserInstanceId !== browserInstanceId) {
-      return emptyLedger(spaceId, browserInstanceId);
-    }
-    const ledger = validateLedger(parsed, spaceId, path);
-    if (browserInstanceId !== void 0 && storedBrowserInstanceId === void 0) {
-      ledger.browserInstanceId = browserInstanceId;
-      await this.#writeAtomic(spaceId, ledger);
-    }
-    return ledger;
+    const base = `space-${spaceId}${scopeSuffix(browserInstanceId)}`;
+    const pattern = new RegExp(`^${base}(?:\\.(\\d+))?\\.json$`);
+    return names.flatMap((name) => {
+      const match = pattern.exec(name);
+      if (!match) return [];
+      return [
+        {
+          seq: match[1] ? Number(match[1]) : 0,
+          path: join(this.rootDir, name)
+        }
+      ];
+    }).sort((a, b) => b.seq - a.seq);
   }
   async #currentBrowserInstanceId() {
     this.#resolvedBrowserInstanceId ||= Promise.resolve(
@@ -305,7 +427,7 @@ class PageLedgerStore {
       throw error;
     }
     await Promise.all(
-      names.filter((name) => /^space-\d+\.json$/.test(name)).map(async (name) => {
+      names.filter((name) => LEDGER_FILE_PATTERN.test(name)).map(async (name) => {
         const path = join(this.rootDir, name);
         const metadata = await stat(path).catch(() => void 0);
         if (!metadata || this.#now() - metadata.mtimeMs < this.#staleAfterMs) {
@@ -324,25 +446,50 @@ class PageLedgerStore {
       })
     );
   }
-  async #writeAtomic(spaceId, ledger) {
-    await mkdir(this.rootDir, { recursive: true, mode: 448 });
-    const path = this.#path(spaceId);
-    const temporary = `${path}.${process.pid}.${this.#writeToken}.${++this.#temporarySequence}.tmp`;
+  /**
+   * Read one ledger document. Returns undefined when the file is gone or does
+   * not parse: a version another process is still writing, or one left
+   * truncated by a crash, must not shadow the version before it. A file that
+   * exists but cannot be opened is reported instead, so a reader never
+   * mistakes a locked current version for a missing one.
+   */
+  async #readLedgerJson(path) {
+    let raw;
     try {
-      await writeFile(temporary, `${JSON.stringify(ledger, null, 2)}
-`, {
-        encoding: "utf8",
-        mode: 384
-      });
-      await rename(temporary, path);
-    } finally {
-      await rm(temporary, { force: true }).catch(() => {
-      });
+      raw = await this.#read(path);
+    } catch (error) {
+      if (error?.code === "ENOENT") return void 0;
+      if (LOCKED_CODES.has(error?.code)) {
+        throw new LedgerLockedError(path, error);
+      }
+      throw error;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return void 0;
     }
   }
-  #path(spaceId) {
-    return join(this.rootDir, `space-${spaceId}.json`);
+  #base(spaceId, browserInstanceId) {
+    return join(
+      this.rootDir,
+      `space-${spaceId}${scopeSuffix(browserInstanceId)}`
+    );
   }
+  /** The shared, unnumbered file that SDKs before instance ids wrote. */
+  #legacyPath(spaceId) {
+    return `${this.#base(spaceId)}.json`;
+  }
+}
+function scopeSuffix(browserInstanceId) {
+  return browserInstanceId === void 0 ? "" : `@${browserInstanceId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+function ownedLedger(value, spaceId, path, browserInstanceId) {
+  const storedBrowserInstanceId = ledgerBrowserInstanceId(value);
+  if (browserInstanceId !== void 0 && storedBrowserInstanceId !== void 0 && storedBrowserInstanceId !== browserInstanceId) {
+    return void 0;
+  }
+  return validateLedger(value, spaceId, path);
 }
 function emptyLedger(spaceId, browserInstanceId) {
   return {

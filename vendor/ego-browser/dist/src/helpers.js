@@ -248,7 +248,12 @@ async function claimResolvedTaskSpace(space, op = "claimTaskSpace") {
   }
   const id = taskSpaceNumericId(space, op);
   const claimed = normalizeTaskSpace(
-    await invokeEgo(op, () => ego.claimTaskSpace(id, space.name))
+    // An empty name would rename the Space while claiming it; omit it so an
+    // unnamed user Space keeps its UI placeholder.
+    await invokeEgo(
+      op,
+      () => space.name ? ego.claimTaskSpace(id, space.name) : ego.claimTaskSpace(id)
+    )
   );
   if (!claimed) {
     throw new Error(`${op} returned an invalid task space`);
@@ -373,15 +378,14 @@ function normalizeTaskSpaces(raw) {
   throw new Error("listTaskSpaces expected { taskSpaces: [...] }");
 }
 function normalizeTaskSpace(space) {
-  const taskId = space?.taskId ?? space?.name ?? space?.id;
-  if (taskId === void 0 || taskId === null || taskId === "") {
+  if (space?.id === void 0 || space?.id === null) {
     return null;
   }
+  const name = space.name ?? space.taskId ?? "";
   return {
     ...space,
-    taskId,
-    id: space?.id ?? taskId,
-    name: space?.name ?? taskId
+    taskId: space.taskId ?? name,
+    name
   };
 }
 function taskSpaceNumericId(space, op) {

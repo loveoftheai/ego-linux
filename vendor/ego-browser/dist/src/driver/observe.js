@@ -1,5 +1,6 @@
+import { randomInt } from "node:crypto";
 import { mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { state } from "../state.js";
 import { cdp, runtimeValue } from "../cdp-eval.js";
@@ -51,7 +52,20 @@ async function elementCenter(selectorOrRef) {
     selectorOrRef
   );
 }
-let screenshotSeq = 0;
+function defaultScreenshotPath() {
+  const outputDir = globalThis.EGO_BROWSER_OUTPUT_DIR;
+  let directory = tmpdir();
+  if (outputDir !== void 0) {
+    if (typeof outputDir !== "string" || outputDir.length === 0 || !isAbsolute(outputDir)) {
+      throw new TypeError(
+        "globalThis.EGO_BROWSER_OUTPUT_DIR must be an absolute directory path"
+      );
+    }
+    directory = outputDir;
+  }
+  const suffix = String(randomInt(0, 1e6)).padStart(6, "0");
+  return join(directory, `ego-browser-shot-${suffix}.png`);
+}
 async function captureScreenshot(path, options = {}) {
   assertScreenshotScale(options.scale);
   const sessionId = isBrowserRuntime() ? await ensureSession() : void 0;
@@ -59,7 +73,7 @@ async function captureScreenshot(path, options = {}) {
 }
 async function captureScreenshotForSession(path, options = {}, sessionId) {
   assertScreenshotScale(options.scale);
-  const outputPath = path ?? join(tmpdir(), `ego-browser-shot-${process.pid}-${++screenshotSeq}.png`);
+  const outputPath = path ?? defaultScreenshotPath();
   const full = options.full ?? false;
   const scale = options.scale ?? "css";
   const raw = scale === "css" ? false : options.raw ?? false;

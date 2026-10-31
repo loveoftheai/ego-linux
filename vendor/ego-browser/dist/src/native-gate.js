@@ -48,7 +48,7 @@ class NativeOperationGate {
     );
     return result;
   }
-  withPage(page, operation) {
+  withPage(page, operation, options = {}) {
     if (!page || typeof page !== "object") {
       throw new TypeError("withPage requires a page target");
     }
@@ -60,7 +60,10 @@ class NativeOperationGate {
       throw new TypeError("withPage requires an operation function");
     }
     return this.withSpace(page.spaceId, async () => {
-      const sessionId = await this.#services.ensureSession(page.targetId);
+      const sessionId = await this.#services.ensureSession(
+        page.targetId,
+        options.sessionTimeoutMs
+      );
       return operation({
         spaceId: page.spaceId,
         targetId: page.targetId,
@@ -87,8 +90,8 @@ const defaultGate = new NativeOperationGate({
 function withSpace(spaceId, operation) {
   return defaultGate.withSpace(spaceId, operation);
 }
-function withPage(page, operation) {
-  return defaultGate.withPage(page, operation);
+function withPage(page, operation, options = {}) {
+  return defaultGate.withPage(page, operation, options);
 }
 export {
   NativeOperationGate,

@@ -15,6 +15,13 @@ function isTransientElementError(error) {
 class PageNavigationTimeoutError extends Error {
   code = "EGO_NAVIGATION_TIMEOUT";
   committed;
+  /**
+   * The Page did not answer at the deadline, so the harness sent
+   * Page.stopLoading and the Page answered again: with `committed` false it
+   * still shows its previous document, with `committed` true the navigation
+   * landed at the deadline and only its remaining loading was stopped.
+   */
+  stopped;
   url;
   readyState;
   waitUntil;
@@ -23,12 +30,16 @@ class PageNavigationTimeoutError extends Error {
     super(message);
     this.name = "PageNavigationTimeoutError";
     this.committed = details.committed;
+    this.stopped = details.stopped === true;
     this.url = details.url;
     this.readyState = details.readyState;
     this.waitUntil = details.waitUntil;
     this.timeoutMs = details.timeoutMs;
   }
 }
+const STOP_PENDING_NAVIGATION_TIMEOUT_MS = 1e3;
+const PREVIOUS_DOCUMENT_PROBE_TIMEOUT_MS = 500;
+const NAVIGATION_DEADLINE_PROBE_TIMEOUT_MS = 250;
 const VISIBILITY_FUNCTION = "function(){if(typeof this.checkVisibility==='function')return this.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});const s=getComputedStyle(this);const r=this.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'&&r.width>0&&r.height>0;}";
 async function waitForSelectorInPage(services, sessionId, refMap, selector, options = {}, getIframeSessions) {
   if (typeof selector !== "string" || selector.length === 0) {
@@ -281,8 +292,10 @@ function invalidURLGlobError(glob, reason) {
 }
 async function navigateInPage(services, sessionId, url, options) {
   const { timeoutMs, waitUntil, referer } = options;
-  const deadline = services.now() + timeoutMs;
+  const deadline = options.deadline ?? services.now() + timeoutMs;
   let committed = false;
+  let navigateSent = false;
+  let previousFrame = {};
   let navigation = {};
   try {
     if (waitUntil === "networkidle") {
@@ -291,6 +304,21 @@ async function navigateInPage(services, sessionId, url, options) {
         navigationTimeRemaining(services, deadline, timeoutMs, waitUntil)
       );
     }
+    previousFrame = await mainFrameIfResponsive(
+      services,
+      sessionId,
+      Math.min(
+        PREVIOUS_DOCUMENT_PROBE_TIMEOUT_MS,
+        navigationTimeRemaining(services, deadline, timeoutMs, waitUntil)
+      )
+    );
+    const navigateBudgetMs = navigationTimeRemaining(
+      services,
+      deadline,
+      timeoutMs,
+      waitUntil
+    );
+    navigateSent = true;
     const response = await services.cdp(
       "Page.navigate",
       {
@@ -298,7 +326,7 @@ async function navigateInPage(services, sessionId, url, options) {
         ...referer === void 0 ? {} : { referrer: referer }
       },
       sessionId,
-      navigationTimeRemaining(services, deadline, timeoutMs, waitUntil)
+      navigateBudgetMs
     );
     navigation = response?.result || response || {};
     if (navigation.errorText) {
@@ -327,28 +355,103 @@ async function navigateInPage(services, sessionId, url, options) {
     });
   } catch (error) {
     if (services.now() >= deadline || isLoadStateTimeout(error)) {
-      if (!committed && navigation.loaderId) {
-        committed = await navigationMatchesCurrentFrame(
+      let probe = committed ? "committed" : "not-committed";
+      if (!committed && navigateSent) {
+        probe = await probeNavigation(
           services,
           sessionId,
           navigation,
-          250
+          previousFrame
         );
       }
+      let stopped = false;
+      if (probe === "unresponsive") {
+        const outcome = await stopPendingNavigation(
+          services,
+          sessionId,
+          navigation,
+          previousFrame
+        );
+        stopped = outcome !== "unresponsive";
+        if (outcome === "committed") probe = "committed";
+      }
+      committed = probe === "committed";
       const state = committed ? await currentDocumentState(services, sessionId) : {};
       throw navigationTimeout(timeoutMs, waitUntil, {
         committed,
-        ...state
+        ...state,
+        stopped,
+        pending: probe === "unresponsive",
+        requestedUrl: url
       });
     }
     throw error;
   }
 }
+function frameShowsNavigation(frame, navigation, previousFrame) {
+  if (navigation.loaderId) {
+    return frame.loaderId === navigation.loaderId && (!navigation.frameId || frame.id === navigation.frameId);
+  }
+  return Boolean(
+    previousFrame.loaderId && frame.loaderId && frame.loaderId !== previousFrame.loaderId
+  );
+}
+async function probeNavigation(services, sessionId, navigation, previousFrame) {
+  let frame;
+  try {
+    frame = await mainFrame(
+      services,
+      sessionId,
+      NAVIGATION_DEADLINE_PROBE_TIMEOUT_MS
+    );
+  } catch (error) {
+    if (isCdpTimeout(error, "Page.getFrameTree")) return "unresponsive";
+    return "not-committed";
+  }
+  return frameShowsNavigation(frame, navigation, previousFrame) ? "committed" : "not-committed";
+}
+async function mainFrameIfResponsive(services, sessionId, timeoutMs) {
+  try {
+    return await mainFrame(services, sessionId, timeoutMs);
+  } catch {
+    return {};
+  }
+}
+async function stopPendingNavigation(services, sessionId, navigation, previousFrame) {
+  try {
+    await services.cdp(
+      "Page.stopLoading",
+      {},
+      sessionId,
+      STOP_PENDING_NAVIGATION_TIMEOUT_MS
+    );
+    const frame = await mainFrame(
+      services,
+      sessionId,
+      STOP_PENDING_NAVIGATION_TIMEOUT_MS
+    );
+    return frameShowsNavigation(frame, navigation, previousFrame) ? "committed" : "stopped";
+  } catch {
+    return "unresponsive";
+  }
+}
+function pendingNavigationNote(what, outcome, retry) {
+  if (outcome === "stopped") {
+    return `; ${what} had not committed and was stopped, so the Page still shows its previous document. Retry ${retry} with a longer timeout, or continue on a new Page from task.newPage().`;
+  }
+  if (outcome === "committed") {
+    return `; ${what} committed at the deadline but its loading was stopped. Call page.reload({ timeout }) if the rest of the document is required.`;
+  }
+  return `; ${what} has not committed and the Page did not answer even after Page.stopLoading, so its renderer is probably hung. Continue on a new Page from task.newPage(), or close this Page and open it again.`;
+}
 async function reloadInPage(services, sessionId, options) {
   const { timeoutMs, waitUntil } = options;
-  const deadline = services.now() + timeoutMs;
+  const deadline = options.deadline ?? services.now() + timeoutMs;
+  let reloadSent = false;
+  let committed = false;
+  let previousFrame = {};
   try {
-    const previousFrame = await mainFrame(
+    previousFrame = await mainFrame(
       services,
       sessionId,
       reloadTimeRemaining(services, deadline, timeoutMs, waitUntil)
@@ -365,6 +468,7 @@ async function reloadInPage(services, sessionId, options) {
       sessionId,
       reloadTimeRemaining(services, deadline, timeoutMs, waitUntil)
     );
+    reloadSent = true;
     await waitForReloadCommit(
       services,
       sessionId,
@@ -373,13 +477,28 @@ async function reloadInPage(services, sessionId, options) {
       timeoutMs,
       waitUntil
     );
+    committed = true;
     if (waitUntil === "commit") return;
     await waitForLoadStateInPage(services, sessionId, waitUntil, {
       timeout: reloadTimeRemaining(services, deadline, timeoutMs, waitUntil)
     });
   } catch (error) {
     if (services.now() >= deadline || isLoadStateTimeout(error)) {
-      throw reloadTimeout(timeoutMs, waitUntil);
+      const pending = !committed && reloadSent && await probeNavigation(services, sessionId, {}, previousFrame) === "unresponsive";
+      throw reloadTimeout(
+        timeoutMs,
+        waitUntil,
+        pending ? pendingNavigationNote(
+          "the reload",
+          await stopPendingNavigation(
+            services,
+            sessionId,
+            {},
+            previousFrame
+          ),
+          "page.reload({ timeout })"
+        ) : ""
+      );
     }
     throw error;
   }
@@ -424,9 +543,9 @@ function reloadTimeRemaining(services, deadline, timeoutMs, waitUntil) {
   if (remaining <= 0) throw reloadTimeout(timeoutMs, waitUntil);
   return remaining;
 }
-function reloadTimeout(timeoutMs, waitUntil) {
+function reloadTimeout(timeoutMs, waitUntil, note = "") {
   return new Error(
-    `page.reload timed out after ${timeoutMs}ms waiting for ${waitUntil}`
+    `page.reload timed out after ${timeoutMs}ms waiting for ${waitUntil}${note}`
   );
 }
 async function waitForNavigationCommit(services, sessionId, navigation, deadline, timeoutMs, waitUntil) {
@@ -458,20 +577,6 @@ async function waitForNavigationCommit(services, sessionId, navigation, deadline
   }
   throw navigationTimeout(timeoutMs, waitUntil);
 }
-async function navigationMatchesCurrentFrame(services, sessionId, navigation, timeoutMs) {
-  try {
-    const response = await services.cdp(
-      "Page.getFrameTree",
-      {},
-      sessionId,
-      timeoutMs
-    );
-    const frame = response?.result?.frameTree?.frame || response?.frameTree?.frame;
-    return Boolean(navigation.loaderId) && frame?.loaderId === navigation.loaderId && (!navigation.frameId || frame?.id === navigation.frameId);
-  } catch {
-    return false;
-  }
-}
 function navigationTimeRemaining(services, deadline, timeoutMs, waitUntil) {
   const remaining = deadline - services.now();
   if (remaining <= 0) throw navigationTimeout(timeoutMs, waitUntil);
@@ -479,12 +584,23 @@ function navigationTimeRemaining(services, deadline, timeoutMs, waitUntil) {
 }
 function navigationTimeout(timeoutMs, waitUntil, details = {}) {
   const committed = details.committed === true;
-  const nextStep = navigationTimeoutNextStep(waitUntil);
-  const state = committed ? `; navigation committed${details.url ? ` at ${JSON.stringify(details.url)}` : ""}${details.readyState ? ` with document.readyState=${JSON.stringify(details.readyState)}` : ""}. ${nextStep}` : "";
+  const stopped = details.stopped === true;
+  let state = "";
+  if (committed) {
+    const where = `${details.url ? ` at ${JSON.stringify(details.url)}` : ""}${details.readyState ? ` with document.readyState=${JSON.stringify(details.readyState)}` : ""}`;
+    state = stopped ? `; navigation committed${where}, but its loading was stopped at the deadline. Call page.reload({ timeout }) if the rest of the document is required.` : `; navigation committed${where}. ${navigationTimeoutNextStep(waitUntil)}`;
+  } else if (stopped || details.pending) {
+    state = pendingNavigationNote(
+      `the navigation${details.requestedUrl ? ` to ${JSON.stringify(details.requestedUrl)}` : ""}`,
+      stopped ? "stopped" : "unresponsive",
+      "page.goto(url, { timeout })"
+    );
+  }
   return new PageNavigationTimeoutError(
     `page.goto timed out after ${timeoutMs}ms waiting for ${waitUntil}${state}`,
     {
       committed,
+      stopped,
       url: details.url,
       readyState: details.readyState,
       waitUntil,
@@ -593,6 +709,7 @@ function isTransientNavigationContextError(error) {
 async function waitForNetworkIdle(services, sessionId, timeoutMs, idleMs) {
   const deadline = services.now() + timeoutMs;
   let sessionIds = [];
+  let lastActivity;
   while (services.now() <= deadline) {
     try {
       const discoveryBudget = Math.max(1, deadline - services.now());
@@ -604,6 +721,7 @@ async function waitForNetworkIdle(services, sessionId, timeoutMs, idleMs) {
       if (trackingBudget <= 0) break;
       await services.ensureNetworkTracking(sessionIds, trackingBudget);
       const activity = services.networkActivity(sessionIds);
+      lastActivity = activity;
       if (activity.tracking && activity.inflight === 0 && services.now() - activity.lastActivityAt >= idleMs) {
         return;
       }
@@ -616,8 +734,17 @@ async function waitForNetworkIdle(services, sessionId, timeoutMs, idleMs) {
     await services.sleep(Math.min(50, waitMs));
   }
   throw new Error(
-    `page.waitForLoadState(networkidle) timed out after ${timeoutMs}ms`
+    `page.waitForLoadState(networkidle) timed out after ${timeoutMs}ms` + describeNetworkActivity(lastActivity)
   );
+}
+function describeNetworkActivity(activity) {
+  if (!activity) return "";
+  if (!activity.tracking) return " (network tracking unavailable)";
+  const pending = activity.pendingRequests || [];
+  if (pending.length === 0) return "";
+  const shown = pending.slice(0, 5).join(", ");
+  const more = pending.length > 5 ? ` and ${pending.length - 5} more` : "";
+  return ` (${pending.length} requests still in flight: ${shown}${more})`;
 }
 function isRetryableNetworkRefreshError(error) {
   if (isCdpRequestTimeoutError(error) || isSessionLostError(error)) return true;

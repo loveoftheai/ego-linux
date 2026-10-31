@@ -15,7 +15,7 @@ function refreshUnhandledPageNotice(spaceId, targetId, url) {
   const key = pageKey(spaceId, targetId);
   const existing = pendingPageNotices.get(key);
   if (!existing) return;
-  recordUnhandledPage({ ...existing, url });
+  pendingPageNotices.set(key, { ...existing, url });
 }
 function markPageObserved(spaceId, targetId) {
   const key = pageKey(spaceId, targetId);

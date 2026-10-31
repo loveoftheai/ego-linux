@@ -6,6 +6,7 @@ import {
 import {
   ACTION_TARGET_STATE_HELPERS,
   EDIT_ACTION_TARGET_HELPERS,
+  ENABLED_SCROLL_TARGET_HELPERS,
   HIT_TARGET_HELPERS,
   SCROLL_TARGET_HELPERS
 } from "./action-target.js";
@@ -153,6 +154,7 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
         frameId: target.frameId,
         actionName: "page.click",
         hitTest: !options.force,
+        requireEnabled: true,
         stability: "recompute",
         pageSessionId: sessionId,
         iframeSessions
@@ -191,20 +193,13 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
         sessionId
       );
       point = { ...pagePoint, local: point.local };
-      await assertElementEnabled(
+      await assertClickTargetActionable(
         services,
         target.sessionId,
         target.objectId,
-        "page.click"
+        point.local,
+        { hitTest: !options.force }
       );
-      if (!options.force) {
-        await assertElementReceivesPointerEvents(
-          services,
-          target.sessionId,
-          target.objectId,
-          point.local
-        );
-      }
       await dispatchMouseEvent(services, target.sessionId, {
         type: "mouseMoved",
         x: point.x,
@@ -216,19 +211,12 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
     }
     for (let count = 1; count <= clickCount; count += 1) {
       if (!target.frameId || count > 1) {
-        await assertElementEnabled(
+        await assertClickTargetActionable(
           services,
           target.sessionId,
           target.objectId,
-          "page.click"
-        );
-      }
-      if (!options.force && !target.frameId) {
-        await assertElementReceivesPointerEvents(
-          services,
-          target.sessionId,
-          target.objectId,
-          point.local
+          point.local,
+          { hitTest: !options.force && !target.frameId }
         );
       }
       await dispatchMouseEvent(services, target.sessionId, {
@@ -255,12 +243,7 @@ async function clickInPage(services, sessionId, refMap, selector, options = {}, 
       }
     }
   } finally {
-    await services.cdp(
-      "Runtime.releaseObject",
-      { objectId: target.objectId },
-      target.sessionId
-    ).catch(() => {
-    });
+    await releaseObject(services, target.sessionId, target.objectId);
   }
 }
 async function fillInPage(services, sessionId, refMap, selector, value, options = {}, iframeSessions = /* @__PURE__ */ new Map()) {
@@ -670,6 +653,7 @@ async function verifyFillOutcome(services, sessionId, objectId, before, value, c
       String(result?.type ?? "")
     );
     lastOutcome = outcome;
+    if (fillOutcomeAccepted(outcome)) return outcome;
     const reading = `${outcome}\0${String(result?.actual ?? "")}`;
     if (reading === prior) {
       consecutiveReads += 1;
@@ -1052,6 +1036,7 @@ async function resolveElementPoint(services, sessionId, objectId, options = {}) 
     frameId,
     actionName = "page.click",
     hitTest = true,
+    requireEnabled = false,
     stability = "strict",
     pageSessionId = sessionId,
     iframeSessions = /* @__PURE__ */ new Map()
@@ -1084,13 +1069,17 @@ async function resolveElementPoint(services, sessionId, objectId, options = {}) 
     ) {
       return { error: "element is not stable" };
     }` : settleExpression;
+  const helpers = hitTest ? HIT_TARGET_HELPERS : requireEnabled ? ENABLED_SCROLL_TARGET_HELPERS : SCROLL_TARGET_HELPERS;
   const expression = `async function(${position ? "position" : ""}) {
-    ${hitTest ? HIT_TARGET_HELPERS : SCROLL_TARGET_HELPERS}
+    ${helpers}
     if (!this.isConnected) return { error: "element is not connected" };
     let rect = this.getBoundingClientRect();
     let point = ${pointExpression};
     if (rect.width <= 0 || rect.height <= 0 || !point) {
       return { error: "element is not visible" };
+    }
+    if (${requireEnabled ? "true" : "false"} && isActionTargetDisabled(this)) {
+      return { error: "element is disabled" };
     }
     const scroll = scrollRequestForPoint(this, point);
     if (scroll) return { scroll };
@@ -1113,33 +1102,24 @@ async function resolveElementPoint(services, sessionId, objectId, options = {}) 
       iframeSessions
     );
   }
-  for (let attempt = 0; attempt <= AUTO_SCROLL_ATTEMPTS; attempt += 1) {
-    const response = await services.cdp(
-      "Runtime.callFunctionOn",
-      {
-        functionDeclaration: expression,
-        objectId,
-        arguments: position ? [{ value: position }] : [],
-        returnByValue: true,
-        awaitPromise: true
-      },
-      sessionId
-    );
-    const point = runtimeValue(response, expression);
-    if (typeof point?.error === "string") {
-      throw new ElementResolutionError(
-        `${actionName} failed: ${point.error}`,
-        "transient"
+  const point = await bringIntoView(services, sessionId, objectId, {
+    actionName,
+    subject: "element",
+    evaluate: async () => {
+      const response = await services.cdp(
+        "Runtime.callFunctionOn",
+        {
+          functionDeclaration: expression,
+          objectId,
+          arguments: position ? [{ value: position }] : [],
+          returnByValue: true,
+          awaitPromise: true
+        },
+        sessionId
       );
-    }
-    const scroll = point?.scroll;
-    if (scroll) {
-      if (attempt === AUTO_SCROLL_ATTEMPTS || !Number.isFinite(scroll.x) || !Number.isFinite(scroll.y) || !Number.isFinite(scroll.deltaX) || !Number.isFinite(scroll.deltaY)) {
-        throw new ElementResolutionError(
-          `${actionName} failed: element is not visible in the viewport`,
-          "transient"
-        );
-      }
+      return runtimeValue(response, expression);
+    },
+    wheel: async (scroll) => {
       const pageScrollPoint = await pagePointForFrame(
         services,
         sessionId,
@@ -1147,36 +1127,78 @@ async function resolveElementPoint(services, sessionId, objectId, options = {}) 
         scroll,
         pageSessionId
       );
-      await dispatchWheelMotion(
-        {
-          dispatch: (params) => dispatchMouseEvent(services, sessionId, params),
-          sleep: services.sleep
-        },
-        {
-          x: pageScrollPoint.x,
-          y: pageScrollPoint.y,
-          deltaX: scroll.deltaX,
-          deltaY: scroll.deltaY
-        }
-      );
-      continue;
+      return dispatchWheelMotion(wheelMotionServices(services, sessionId), {
+        x: pageScrollPoint.x,
+        y: pageScrollPoint.y,
+        deltaX: scroll.deltaX,
+        deltaY: scroll.deltaY
+      });
     }
-    if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
-      throw new Error(`${actionName} could not resolve the element position`);
-    }
-    const pagePoint = await pagePointForFrame(
-      services,
-      sessionId,
-      frameId,
-      point,
-      pageSessionId
-    );
-    return { ...pagePoint, local: point };
+  });
+  if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
+    throw new Error(`${actionName} could not resolve the element position`);
   }
-  throw new ElementResolutionError(
-    `${actionName} failed: element is not visible in the viewport`,
+  const pagePoint = await pagePointForFrame(
+    services,
+    sessionId,
+    frameId,
+    point,
+    pageSessionId
+  );
+  return { ...pagePoint, local: point };
+}
+function wheelMotionServices(services, sessionId) {
+  return {
+    dispatch: (params) => dispatchMouseEvent(services, sessionId, params),
+    sleep: services.sleep,
+    exhausted: () => actionDeadlinePassed(services)
+  };
+}
+function actionDeadlinePassed(services) {
+  return services.actionDeadline !== void 0 && services.now !== void 0 && services.now() >= services.actionDeadline;
+}
+function sameWheelRequest(a, b) {
+  return Math.abs(a.x - b.x) < 1 && Math.abs(a.y - b.y) < 1 && Math.abs(a.deltaX - b.deltaX) < 1 && Math.abs(a.deltaY - b.deltaY) < 1;
+}
+async function bringIntoView(services, sessionId, objectId, input) {
+  const notVisible = () => new ElementResolutionError(
+    `${input.actionName} failed: ${input.subject} is not visible in the viewport`,
     "transient"
   );
+  let previous;
+  let fellBack = false;
+  for (let attempt = 0; attempt <= AUTO_SCROLL_ATTEMPTS; attempt += 1) {
+    const result = await input.evaluate();
+    if (typeof result?.error === "string") {
+      throw new ElementResolutionError(
+        `${input.actionName} failed: ${result.error}`,
+        "transient"
+      );
+    }
+    const scroll = result?.scroll;
+    if (!scroll) return result;
+    if (attempt === AUTO_SCROLL_ATTEMPTS || !Number.isFinite(scroll.x) || !Number.isFinite(scroll.y) || !Number.isFinite(scroll.deltaX) || !Number.isFinite(scroll.deltaY) || actionDeadlinePassed(services)) {
+      throw notVisible();
+    }
+    if (previous && sameWheelRequest(previous, scroll)) {
+      if (fellBack) throw notVisible();
+      fellBack = true;
+      previous = void 0;
+      try {
+        await services.cdp(
+          "DOM.scrollIntoViewIfNeeded",
+          { objectId },
+          sessionId
+        );
+      } catch {
+        throw notVisible();
+      }
+      continue;
+    }
+    previous = scroll;
+    if (!await input.wheel(scroll)) throw notVisible();
+  }
+  throw notVisible();
 }
 async function ensureFrameOwnerInView(services, pageSessionId, frameId, actionName, iframeSessions, visited = /* @__PURE__ */ new Set()) {
   if (visited.has(frameId)) return;
@@ -1230,40 +1252,27 @@ async function ensureFrameOwnerInView(services, pageSessionId, frameId, actionNa
     return { scroll: scrollRequestForPoint(this, point) };
   }`;
   try {
-    for (let attempt = 0; attempt <= AUTO_SCROLL_ATTEMPTS; attempt += 1) {
-      const response = await services.cdp(
-        "Runtime.callFunctionOn",
-        {
-          functionDeclaration: source,
-          objectId,
-          returnByValue: true,
-          awaitPromise: false
-        },
-        ownerSessionId
-      );
-      const result = runtimeValue(response, source);
-      if (typeof result?.error === "string") {
-        throw new ElementResolutionError(
-          `${actionName} failed: ${result.error}`,
-          "transient"
+    await bringIntoView(services, ownerSessionId, objectId, {
+      actionName,
+      subject: "iframe",
+      evaluate: async () => {
+        const response = await services.cdp(
+          "Runtime.callFunctionOn",
+          {
+            functionDeclaration: source,
+            objectId,
+            returnByValue: true,
+            awaitPromise: false
+          },
+          ownerSessionId
         );
-      }
-      const scroll = result?.scroll;
-      if (!scroll) return;
-      if (attempt === AUTO_SCROLL_ATTEMPTS || !Number.isFinite(scroll.x) || !Number.isFinite(scroll.y) || !Number.isFinite(scroll.deltaX) || !Number.isFinite(scroll.deltaY)) {
-        throw new ElementResolutionError(
-          `${actionName} failed: iframe is not visible in the viewport`,
-          "transient"
-        );
-      }
-      await dispatchWheelMotion(
-        {
-          dispatch: (params) => dispatchMouseEvent(services, ownerSessionId, params),
-          sleep: services.sleep
-        },
+        return runtimeValue(response, source);
+      },
+      wheel: (scroll) => dispatchWheelMotion(
+        wheelMotionServices(services, ownerSessionId),
         scroll
-      );
-    }
+      )
+    });
   } finally {
     await releaseObject(services, ownerSessionId, objectId);
   }
@@ -1336,6 +1345,39 @@ async function cursorPointForElement(services, pageSessionId, targetSessionId, f
     return point;
   } catch {
     return inputPoint;
+  }
+}
+async function assertClickTargetActionable(services, sessionId, objectId, point, options) {
+  const { hitTest, actionName = "page.click" } = options;
+  const expression = `function clickTargetActionable(point) {
+    ${hitTest ? HIT_TARGET_HELPERS : ACTION_TARGET_STATE_HELPERS}
+    if (!this.isConnected) return { error: "element is not connected" };
+    if (isActionTargetDisabled(this)) return { error: "element is disabled" };
+    if (${hitTest ? "true" : "false"}) {
+      const interceptor = interceptingElementAtPoint(this, point);
+      if (interceptor) {
+        return { error: describeHitTarget(interceptor) + " intercepts pointer events" };
+      }
+    }
+    return { ok: true };
+  }`;
+  const response = await services.cdp(
+    "Runtime.callFunctionOn",
+    {
+      functionDeclaration: expression,
+      objectId,
+      arguments: [{ value: point }],
+      returnByValue: true,
+      awaitPromise: false
+    },
+    sessionId
+  );
+  const result = runtimeValue(response, expression);
+  if (typeof result?.error === "string") {
+    throw new ElementResolutionError(
+      `${actionName} failed: ${result.error}`,
+      "transient"
+    );
   }
 }
 async function assertElementReceivesPointerEvents(services, sessionId, objectId, point) {
@@ -1444,7 +1486,7 @@ function showAgentActionLabel(services, label) {
   }
 }
 async function releaseObject(services, sessionId, objectId) {
-  await services.cdp("Runtime.releaseObject", { objectId }, sessionId).catch(() => {
+  void services.cdp("Runtime.releaseObject", { objectId }, sessionId).catch(() => {
   });
 }
 function assertPoint(x, y, operation) {

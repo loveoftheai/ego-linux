@@ -1,17 +1,17 @@
 import { cdp, js } from "../cdp-eval.js";
 import { browserCdp } from "../browser-runtime.js";
+import { buildSelectorCenterJs, isRawSelector } from "../element-resolver.js";
 import { elementCenter } from "./observe.js";
 import { resolveAndCall } from "./element-ops.js";
-const INPUT_EVENT_DELAY_MS = 25;
+const INPUT_EVENT_DELAY_MS = 0;
 const INPUT_DISPATCH_TIMEOUT_MS = 1e3;
+const CLICK_PROBE_TTL_MS = 5e3;
 async function click(target, options = {}) {
-  const point = await resolveMouseTarget(target);
+  const { probeId, ...point } = await resolveClickTarget(target);
   const button = options.button || "left";
   const buttons = pressedButtons(button);
   const clickCount = options.clickCount ?? options.clicks ?? 1;
   maybeHighlight(point, options.label);
-  const probeId = await installClickProbe(point);
-  let dispatchError = null;
   try {
     await dispatchMouse(point, "mouseMoved", {
       button: "none",
@@ -31,10 +31,9 @@ async function click(target, options = {}) {
     });
   } catch (error) {
     if (!isInputDispatchTimeout(error)) throw error;
-    dispatchError = error;
+    const completed = await finishClickProbe(point, probeId, clickCount);
+    if (!completed) throw error;
   }
-  const completed = await finishClickProbe(point, probeId, clickCount);
-  if (dispatchError && !completed) throw dispatchError;
 }
 async function doubleClick(target, options = {}) {
   await click(target, { ...options, clickCount: 2 });
@@ -50,7 +49,11 @@ async function hover(target, options = {}) {
     if (!isInputDispatchTimeout(error)) throw error;
     dispatchError = error;
   }
-  const completed = await finishHoverProbe(point, probeId);
+  const completed = await finishHoverProbe(
+    point,
+    probeId,
+    Boolean(dispatchError)
+  );
   if (dispatchError && !completed) throw dispatchError;
 }
 async function dragMouse(points, options = {}) {
@@ -100,31 +103,86 @@ async function dragMouse(points, options = {}) {
     if (!isInputDispatchTimeout(error)) throw error;
     dispatchError = error;
   }
-  const completed = await finishDragProbe(resolved, probeId, button);
+  const completed = await finishDragProbe(
+    resolved,
+    probeId,
+    button,
+    Boolean(dispatchError)
+  );
   if (dispatchError && !completed) throw dispatchError;
 }
 function inputEventDelay(ms = INPUT_EVENT_DELAY_MS) {
+  if (!(ms > 0)) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function resolveClickTarget(target) {
+  if (typeof target === "string" && canProbeInputFallback()) {
+    const point2 = await resolveRawSelectorClickTarget(target);
+    if (point2) return point2;
+  }
+  const point = await resolveMouseTarget(target);
+  return { ...point, probeId: await installClickProbe(point) };
+}
+async function resolveRawSelectorClickTarget(selector) {
+  if (!isRawSelector(selector)) return null;
+  const id = newProbeId("click");
+  const expression = `(() => {
+    const center = ${buildSelectorCenterJs(selector)};
+    if (!center) return null;
+    ${clickProbeInstallJs(id, "center")}
+    return { x: center.x, y: center.y };
+  })()`;
+  const result = await cdp("Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: false
+  });
+  if (result.exceptionDetails) return null;
+  const value = result.result?.value;
+  if (typeof value?.x !== "number" || typeof value?.y !== "number") {
+    return null;
+  }
+  return { x: value.x, y: value.y, sessionId: void 0, probeId: id };
+}
+function newProbeId(kind) {
+  return `${kind}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+function clickProbeInstallJs(id, pointExpression) {
+  return `
+    const probePoint = ${pointExpression};
+    window.__egoBrowserInputProbes ||= {};
+    const probe = { seen: false, target: document.elementFromPoint(probePoint.x, probePoint.y) };
+    probe.dispose = () => {
+      document.removeEventListener("click", probe.handler, true);
+      clearTimeout(probe.timer);
+    };
+    probe.handler = (event) => {
+      if (
+        event.isTrusted && probe.target &&
+        (event.target === probe.target || probe.target.contains(event.target))
+      ) {
+        probe.seen = true;
+        probe.dispose();
+      }
+    };
+    probe.timer = setTimeout(() => {
+      probe.dispose();
+      delete window.__egoBrowserInputProbes[${JSON.stringify(id)}];
+    }, ${JSON.stringify(CLICK_PROBE_TTL_MS)});
+    document.addEventListener("click", probe.handler, true);
+    window.__egoBrowserInputProbes[${JSON.stringify(id)}] = probe;
+  `;
 }
 async function installClickProbe(point) {
   if (!canProbeInputFallback()) return null;
-  const id = `click_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const id = newProbeId("click");
   try {
     const result = await cdp(
       "Runtime.evaluate",
       {
         expression: `(() => {
-        const target = document.elementFromPoint(${JSON.stringify(point.x)}, ${JSON.stringify(point.y)});
-        window.__egoBrowserInputProbes ||= {};
-        const probe = { seen: false, target };
-        probe.handler = (event) => {
-          if (event.isTrusted && target && (event.target === target || target.contains(event.target))) {
-            probe.seen = true;
-          }
-        };
-        document.addEventListener("click", probe.handler, true);
-        window.__egoBrowserInputProbes[${JSON.stringify(id)}] = probe;
-        return Boolean(target);
+        ${clickProbeInstallJs(id, JSON.stringify({ x: point.x, y: point.y }))}
+        return Boolean(probe.target);
       })()`,
         returnByValue: true,
         awaitPromise: false
@@ -147,7 +205,7 @@ async function finishClickProbe(point, id, clickCount) {
         const probes = window.__egoBrowserInputProbes || {};
         const probe = probes[${JSON.stringify(id)}];
         if (!probe) return { seen: false, fallback: false };
-        document.removeEventListener("click", probe.handler, true);
+        probe.dispose();
         delete probes[${JSON.stringify(id)}];
         if (probe.seen || !probe.target) return { seen: probe.seen, fallback: false };
         const target = probe.target;
@@ -240,9 +298,9 @@ async function installHoverProbe(point) {
     return null;
   }
 }
-async function finishHoverProbe(point, id) {
+async function finishHoverProbe(point, id, settle) {
   if (!id) return false;
-  await inputEventDelay(50);
+  if (settle) await inputEventDelay(50);
   try {
     const result = await cdp(
       "Runtime.evaluate",
@@ -280,9 +338,9 @@ async function finishHoverProbe(point, id) {
     return false;
   }
 }
-async function finishDragProbe(points, id, button) {
+async function finishDragProbe(points, id, button, settle) {
   if (!id) return false;
-  await inputEventDelay(50);
+  if (settle) await inputEventDelay(50);
   const first = points[0];
   const last = points.at(-1);
   try {

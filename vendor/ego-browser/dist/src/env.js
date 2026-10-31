@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { loadEnvFile as loadNodeEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
@@ -13,6 +14,11 @@ function agentWorkspace() {
     return bundledSkill;
   }
   return resolve(REPO_ROOT, "..", "..", "skills", "ego-browser");
+}
+function runtimeStateDir() {
+  return resolvePath(
+    process.env.EGO_BROWSER_STATE_DIR || join(homedir(), ".ego-browser", "state")
+  );
 }
 function resolvePath(path) {
   if (path.startsWith("~")) {
@@ -35,5 +41,6 @@ function loadEnv() {
 }
 export {
   agentWorkspace,
-  loadEnv
+  loadEnv,
+  runtimeStateDir
 };

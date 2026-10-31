@@ -5,6 +5,7 @@ import {
   isEgoUserControlError
 } from "./ego-errors.js";
 const RESPONSE_TIMEOUT_MS = 15e3;
+const SESSION_SETUP_WAIT_MS = 2e3;
 const SESSION_TTL_MS = 2e3;
 const MAX_BUFFERED_EVENTS = 1e4;
 const SESSION_LOST = /Session (?:with given id )?not found|Target closed|No session/i;
@@ -14,13 +15,11 @@ const OOPIF_AUTO_ATTACH_PARAMS = {
   autoAttach: true,
   waitForDebuggerOnStart: true,
   flatten: true,
-  // Ego Lite can pause an excluded dedicated worker without attaching it,
-  // leaving no session through which the harness can resume that worker.
-  filter: [
-    { type: "iframe", exclude: false },
-    { type: "worker", exclude: false },
-    { exclude: true }
-  ]
+  // Ego Lite can pause an excluded related target (dedicated worker,
+  // AudioWorklet, ...) without attaching it, leaving no session through which
+  // the harness can resume it. Attach every type; the attach handler resumes
+  // and detaches everything except iframes.
+  filter: [{}]
 };
 const DIALOG_SAFE_METHOD = (method) => BROWSER_LEVEL(method) || method === "Page.handleJavaScriptDialog" || method === "Page.setDownloadBehavior";
 let nextMessageId = 1;
@@ -49,6 +48,27 @@ class CdpRequestTimeoutError extends Error {
     this.timeoutMs = timeoutMs;
     this.sessionId = sessionId;
   }
+}
+class PageUnresponsiveError extends CdpRequestTimeoutError {
+  code = "EGO_PAGE_UNRESPONSIVE";
+  waitedMs;
+  targetId;
+  /**
+   * The pending navigation was stopped once the wait ran out and the Page
+   * answers again; `currentUrl` is what its main frame showed afterwards.
+   */
+  stopped = false;
+  currentUrl;
+  constructor(method, waitedMs, targetId, sessionId) {
+    super(method, waitedMs, sessionId);
+    this.name = "PageUnresponsiveError";
+    this.message = `Page did not answer ${method} within ${waitedMs}ms; its main-frame navigation has not committed or its renderer is unresponsive`;
+    this.waitedMs = waitedMs;
+    this.targetId = targetId;
+  }
+}
+function isPageUnresponsiveError(error) {
+  return error instanceof PageUnresponsiveError || error instanceof Error && error.code === "EGO_PAGE_UNRESPONSIVE";
 }
 function isCdpRequestTimeoutError(error) {
   return error instanceof CdpRequestTimeoutError || Boolean(error) && typeof error === "object" && error.code === "EGO_CDP_REQUEST_TIMEOUT";
@@ -91,7 +111,9 @@ function targetState(targetId) {
       sessionAt: 0,
       sessionInflight: null,
       events: [],
+      egoAutomationEnabled: false,
       pageEventsEnabled: false,
+      pageEnableInflight: null,
       networkDomainEnabled: false,
       networkEnableInflight: null,
       autoAttachEnabled: false,
@@ -118,7 +140,9 @@ function registerSession(targetId, sessionId) {
   }
   target.sessionId = sessionId;
   target.sessionAt = Date.now();
+  target.egoAutomationEnabled = false;
   target.pageEventsEnabled = false;
+  target.pageEnableInflight = null;
   target.networkDomainEnabled = false;
   target.networkEnableInflight = null;
   target.autoAttachEnabled = false;
@@ -214,7 +238,9 @@ function clearTargetSession(targetId, { remove = false } = {}) {
   target.sessionAt = 0;
   target.sessionInflight = null;
   target.events.length = 0;
+  target.egoAutomationEnabled = false;
   target.pageEventsEnabled = false;
+  target.pageEnableInflight = null;
   target.networkDomainEnabled = false;
   target.networkEnableInflight = null;
   target.autoAttachEnabled = false;
@@ -398,6 +424,7 @@ function recordCommandState(method, params, sessionId, response) {
     const attachedSessionId = response.result?.sessionId || response.sessionId;
     if (params?.targetId && attachedSessionId) {
       registerSession(params.targetId, attachedSessionId);
+      enableEgoAutomation(attachedSessionId);
     }
     return;
   }
@@ -430,11 +457,12 @@ function recordCommandState(method, params, sessionId, response) {
 async function ensureSession(requestedTargetId = void 0, timeoutMs = RESPONSE_TIMEOUT_MS) {
   const cachedTargetId = requestedTargetId || state.preferredTargetId || defaultTargetId;
   const cached = cachedTargetId ? targetStates.get(cachedTargetId) : void 0;
+  const setupWaitMs = Math.min(Math.max(1, timeoutMs), SESSION_SETUP_WAIT_MS);
   if (cached?.sessionId && Date.now() - cached.sessionAt < SESSION_TTL_MS) {
     await Promise.all([
-      enablePageEvents(cached.sessionId, timeoutMs),
-      enableNetworkTrackingForSession(cached.sessionId, false, timeoutMs),
-      enableOopifAutoAttach(cached.sessionId, timeoutMs)
+      enablePageEvents(cached.sessionId, setupWaitMs),
+      enableNetworkTrackingForSession(cached.sessionId, false, setupWaitMs),
+      enableOopifAutoAttach(cached.sessionId, setupWaitMs)
     ]);
     cached.sessionAt = Date.now();
     return cached.sessionId;
@@ -473,10 +501,11 @@ async function ensureSession(requestedTargetId = void 0, timeoutMs = RESPONSE_TI
         }
         registerSession(targetId, sessionId);
       }
+      enableEgoAutomation(target.sessionId);
       await Promise.all([
-        enablePageEvents(target.sessionId, timeoutMs),
-        enableNetworkTrackingForSession(target.sessionId, false, timeoutMs),
-        enableOopifAutoAttach(target.sessionId, timeoutMs)
+        enablePageEvents(target.sessionId, setupWaitMs),
+        enableNetworkTrackingForSession(target.sessionId, false, setupWaitMs),
+        enableOopifAutoAttach(target.sessionId, setupWaitMs)
       ]);
       target.sessionAt = Date.now();
       return target.sessionId;
@@ -490,13 +519,28 @@ async function ensureFrameSessions(pageTargetId, timeoutMs = RESPONSE_TIMEOUT_MS
   if (typeof pageTargetId !== "string" || pageTargetId.length === 0) {
     throw new TypeError("ensureFrameSessions requires a non-empty targetId");
   }
-  const deadline = state.now() + Math.max(1, timeoutMs);
+  const startedAt = state.now();
+  const deadline = startedAt + Math.max(1, timeoutMs);
   const remaining = () => Math.max(1, deadline - state.now());
   const pageSessionId = await ensureSession(pageTargetId, remaining());
-  const [response, frameTreeResponse] = await Promise.all([
-    browserCdp("Target.getTargets", {}, void 0, remaining()),
-    browserCdp("Page.getFrameTree", {}, pageSessionId, remaining())
-  ]);
+  let response;
+  let frameTreeResponse;
+  try {
+    [response, frameTreeResponse] = await Promise.all([
+      browserCdp("Target.getTargets", {}, void 0, remaining()),
+      browserCdp("Page.getFrameTree", {}, pageSessionId, remaining())
+    ]);
+  } catch (error) {
+    if (isCdpRequestTimeoutError(error) && error.method === "Page.getFrameTree") {
+      throw new PageUnresponsiveError(
+        "Page.getFrameTree",
+        state.now() - startedAt,
+        pageTargetId,
+        pageSessionId
+      );
+    }
+    throw error;
+  }
   const targetInfos = response?.result?.targetInfos || response?.targetInfos || [];
   const frameTree = frameTreeResponse?.result?.frameTree || frameTreeResponse?.frameTree;
   const frameParents = /* @__PURE__ */ new Map();
@@ -682,6 +726,8 @@ function networkActivity(sessionIds) {
   let tracking = sessionIds.length > 0;
   let inflight = 0;
   let lastActivityAt = 0;
+  const pendingRequests = [];
+  const counted = /* @__PURE__ */ new Set();
   for (const sessionId of new Set(sessionIds)) {
     const targetId = sessionTargets.get(sessionId);
     const target = targetId ? targetStates.get(targetId) : void 0;
@@ -689,10 +735,21 @@ function networkActivity(sessionIds) {
       tracking = false;
       continue;
     }
-    inflight += target.inflightNetworkRequests.size;
-    lastActivityAt = Math.max(lastActivityAt, target.lastNetworkActivityAt);
+    for (const treeTargetId of pageTreeTargetIds(targetId)) {
+      if (counted.has(treeTargetId)) continue;
+      counted.add(treeTargetId);
+      const member = targetStates.get(treeTargetId);
+      if (!member) continue;
+      inflight += member.inflightNetworkRequests.size;
+      lastActivityAt = Math.max(lastActivityAt, member.lastNetworkActivityAt);
+      for (const request of member.inflightNetworkRequests.values()) {
+        pendingRequests.push(
+          `${request.type || "Other"} ${request.url || request.requestId}`
+        );
+      }
+    }
   }
-  return { tracking, inflight, lastActivityAt };
+  return { tracking, inflight, lastActivityAt, pendingRequests };
 }
 async function pageNetworkSessions(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
   const targetId = sessionTargets.get(sessionId);
@@ -799,15 +856,34 @@ function prepareFileChooser(sessionId, { timeoutMs, cancel }) {
   });
   return interception;
 }
+function enableEgoAutomation(sessionId) {
+  const targetId = sessionId ? sessionTargets.get(sessionId) : void 0;
+  const target = targetId ? targetStates.get(targetId) : void 0;
+  if (!target || target.sessionId !== sessionId || target.egoAutomationEnabled) {
+    return;
+  }
+  target.egoAutomationEnabled = true;
+  void rawCdp("egoAutomated.enable", {}, sessionId).catch(() => {
+  });
+}
 async function enablePageEvents(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
   const targetId = sessionId ? sessionTargets.get(sessionId) : void 0;
   const target = targetId ? targetStates.get(targetId) : void 0;
-  if (!target || target.pageEventsEnabled) {
+  if (!target || target.sessionId !== sessionId || target.pageEventsEnabled) {
     return;
   }
   try {
-    await rawCdp("Page.enable", {}, sessionId, timeoutMs);
-    target.pageEventsEnabled = true;
+    await sharedSetupCommand(
+      target,
+      "pageEnableInflight",
+      "Page.enable",
+      {},
+      sessionId,
+      timeoutMs,
+      () => {
+        target.pageEventsEnabled = true;
+      }
+    );
   } catch {
   }
 }
@@ -823,36 +899,21 @@ async function enableNetworkTrackingForSession(sessionId, required = false, time
     return;
   }
   if (target.networkDomainEnabled) return;
-  let inflight = target.networkEnableInflight;
-  const reusedInflight = Boolean(inflight);
-  if (!inflight) {
-    inflight = rawCdp("Network.enable", {}, sessionId, timeoutMs).then(() => {
-      if (target.sessionId === sessionId && !target.networkDomainEnabled) {
-        target.lastNetworkActivityAt = state.now();
-        target.networkDomainEnabled = true;
-      }
-    });
-    target.networkEnableInflight = inflight;
-    void inflight.then(
+  try {
+    await sharedSetupCommand(
+      target,
+      "networkEnableInflight",
+      "Network.enable",
+      {},
+      sessionId,
+      timeoutMs,
       () => {
-        if (target.networkEnableInflight === inflight) {
-          target.networkEnableInflight = null;
-        }
-      },
-      () => {
-        if (target.networkEnableInflight === inflight) {
-          target.networkEnableInflight = null;
+        if (!target.networkDomainEnabled) {
+          target.lastNetworkActivityAt = state.now();
+          target.networkDomainEnabled = true;
         }
       }
     );
-  }
-  try {
-    await (reusedInflight ? waitForSharedCdpRequest(
-      inflight,
-      "Network.enable",
-      sessionId,
-      timeoutMs
-    ) : inflight);
   } catch (error) {
     if (required) throw error;
   }
@@ -868,46 +929,45 @@ async function enableOopifAutoAttach(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS)
   if (!target || target.sessionId !== sessionId || target.autoAttachEnabled) {
     return;
   }
-  let inflight = target.autoAttachInflight;
-  const reusedInflight = Boolean(inflight);
-  if (!inflight) {
-    inflight = rawCdp(
+  try {
+    await sharedSetupCommand(
+      target,
+      "autoAttachInflight",
       "Target.setAutoAttach",
       OOPIF_AUTO_ATTACH_PARAMS,
       sessionId,
-      timeoutMs
-    ).then(() => {
-      if (target.sessionId === sessionId) target.autoAttachEnabled = true;
-    });
-    target.autoAttachInflight = inflight;
-    void inflight.then(
+      timeoutMs,
       () => {
-        if (target.autoAttachInflight === inflight) {
-          target.autoAttachInflight = null;
-        }
-      },
-      () => {
-        if (target.autoAttachInflight === inflight) {
-          target.autoAttachInflight = null;
-        }
+        target.autoAttachEnabled = true;
       }
     );
-  }
-  try {
-    await (reusedInflight ? waitForSharedCdpRequest(
-      inflight,
-      "Target.setAutoAttach",
-      sessionId,
-      timeoutMs
-    ) : inflight);
   } catch {
   }
+}
+function sharedSetupCommand(target, key, method, params, sessionId, timeoutMs, onSuccess) {
+  let inflight = target[key];
+  if (!inflight) {
+    inflight = rawCdp(method, params, sessionId).then(() => {
+      if (target.sessionId === sessionId) onSuccess();
+    });
+    target[key] = inflight;
+    const clear = () => {
+      if (target[key] === inflight) target[key] = null;
+    };
+    void inflight.then(clear, clear);
+  }
+  return waitForSharedCdpRequest(inflight, method, sessionId, timeoutMs);
 }
 function waitForSharedCdpRequest(request, method, sessionId, timeoutMs) {
   const callerTimeoutMs = Math.max(1, timeoutMs);
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new CdpRequestTimeoutError(method, callerTimeoutMs, sessionId));
+      const dialog = DIALOG_SAFE_METHOD(method) ? null : pendingDialog(sessionId);
+      reject(
+        dialog ? new PageDialogOpenedError(method, sessionId, dialog, {
+          alreadyOpen: true
+        }) : new CdpRequestTimeoutError(method, callerTimeoutMs, sessionId)
+      );
     }, callerTimeoutMs);
     request.then(
       () => {
@@ -922,12 +982,21 @@ function waitForSharedCdpRequest(request, method, sessionId, timeoutMs) {
   });
 }
 function initializeAutoAttachedTarget(sessionId, waitingForDebugger) {
+  enableEgoAutomation(sessionId);
   const pageEvents = enablePageEvents(sessionId);
   const networkEvents = enableNetworkTrackingForSession(sessionId);
   const nestedFrames = enableOopifAutoAttach(sessionId);
   const resume = waitingForDebugger ? rawCdp("Runtime.runIfWaitingForDebugger", {}, sessionId).catch(() => {
   }) : Promise.resolve();
   void Promise.allSettled([pageEvents, networkEvents, nestedFrames, resume]);
+}
+function releaseAutoAttachedTarget(sessionId, parentSessionId, waitingForDebugger) {
+  const resume = waitingForDebugger ? rawCdp("Runtime.runIfWaitingForDebugger", {}, sessionId) : Promise.resolve();
+  void resume.catch(() => {
+  }).then(
+    () => rawCdp("Target.detachFromTarget", { sessionId }, parentSessionId)
+  ).catch(() => {
+  });
 }
 function finishNetworkRequest(targetId, requestId) {
   const now = state.now();
@@ -974,7 +1043,8 @@ function recordNetworkEvent(targetId, target, data) {
       requestId,
       ...typeof data.params?.frameId === "string" ? { frameId: data.params.frameId } : {},
       ...typeof data.params?.loaderId === "string" ? { loaderId: data.params.loaderId } : {},
-      ...typeof data.params?.type === "string" ? { type: data.params.type } : {}
+      ...typeof data.params?.type === "string" ? { type: data.params.type } : {},
+      ...typeof url === "string" ? { url } : {}
     });
     target.lastNetworkActivityAt = state.now();
     return;
@@ -1103,6 +1173,12 @@ function handleMessage(message) {
         sessionId2,
         data.params?.waitingForDebugger === true
       );
+    } else if (sessionId2 && sourceTargetId && targetType !== "page") {
+      releaseAutoAttachedTarget(
+        sessionId2,
+        data.sessionId,
+        data.params?.waitingForDebugger === true
+      );
     } else if (sessionId2 && data.params?.waitingForDebugger === true) {
       void rawCdp("Runtime.runIfWaitingForDebugger", {}, sessionId2).catch(
         () => {
@@ -1191,6 +1267,7 @@ function browserSnapshotRefsToRefMap(refMap, refs = []) {
 export {
   CdpRequestTimeoutError,
   PageDialogOpenedError,
+  PageUnresponsiveError,
   browserCdp,
   browserEgo,
   browserSnapshotRefsToRefMap,
@@ -1207,6 +1284,7 @@ export {
   isFrameLifecycleError,
   isNetworkDomainEnabled,
   isPageDialogOpenedError,
+  isPageUnresponsiveError,
   isRetryableFrameLifecycleError,
   isSessionLostError,
   networkActivity,
