@@ -868,6 +868,15 @@ function enableEgoAutomation(sessionId) {
   }
   target.egoAutomationEnabled = true;
   void rawCdp("egoAutomated.enable", {}, sessionId).catch(() => {
+    void rawCdp(
+      "Page.addScriptToEvaluateOnNewDocument",
+      {
+        source: "Object.defineProperty(navigator,'webdriver',{get:()=>false,configurable:true});try{Object.defineProperty(console,'debug',{value:console.debug,writable:true,configurable:false});Object.defineProperty(console,'clear',{value:console.clear,writable:true,configurable:false});}catch(e){}if(!window.chrome){window.chrome={runtime:{}};}",
+        runImmediately: true
+      },
+      sessionId
+    ).catch(() => {
+    });
   });
 }
 async function enablePageEvents(sessionId, timeoutMs = responseTimeoutMs()) {

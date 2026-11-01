@@ -250,3 +250,30 @@ Node 进程"一致）：
   内 + 已有 CDP 转发（`Page.stopLoading`/`Page.getFrameTree`/
   `Runtime.evaluate` 均为旧有转发方法）。
 - VERSION：`0.6.0.16-linux.3`（package.json 同步）。
+
+## 2026-11-01（补推）：linux.4——找回 Justin 的 CDP  masking 回退
+
+事故经过（已如实记录，不遮掩）：
+- linux.3 推送后读回核验发现：新提交的父提交不是 linux.2（`22f3e4dd`），
+  而是 Justin 本人 2026-10-31 亲推的 `3d6f570`（“Mask CDP automation signals
+  on stock Chromium builds”）。该提交只改了 `sdk/index.js` 一个文件：在
+  `egoAutomated.enable` 失败时注入 `Page.addScriptToEvaluateOnNewDocument`
+  脚本，掩盖 stock Chromium 下 CDP  attach 泄漏的自动化信号
+ （`navigator.webdriver`、console.debug/clear 探针、缺失的 `window.chrome`），
+  否则 Google 登录这类站点会直接拦截。
+- linux.3 的 bundle 是从上游源码重建的，`sdk/index.js` 被全新上游 bundle
+  覆盖，Justin 的手工补丁随之丢失（逐文件比对确认：除版本与本次同步文件外，
+  唯一被“还原”的就是他的 masking 修改；其余文件无回退）。
+- 教训（流程级）：**已发布树里的 `sdk/index.js` 不可只改发布物**——下次同步
+  重建 bundle 必然覆盖。Port 侧补丁必须落在源码层（本次做法），且同步流程
+  每次推前必须把远端 HEAD 与本地基线逐文件比对，不能只比对“基线 VERSION”。
+
+本次修复：
+- 把 Justin 的回退逻辑原文（注释 + 注入脚本逐字相同）打到上游源码层
+  `browser-runtime.ts` 的 `enableEgoAutomation()` 里（`egoAutomated.enable`
+  的 catch 分支内再发 `Page.addScriptToEvaluateOnNewDocument`），重建后
+  bundle 与 transpiled src 均含该分支；`vendor/` 与 `sdk/` 双份一致。
+- 同步流程新增一项固定动作：以后的每日同步在推前必须先取远端 HEAD 树，
+  与本地基线逐文件比对，远端单方面新增的修改必须先合入本地再推，杜绝
+  “整树覆盖式推送丢修改”重演。
+- VERSION：`0.6.0.16-linux.4`（package.json 同步）；其余内容与 linux.3 相同。

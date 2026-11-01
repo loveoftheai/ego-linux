@@ -8799,7 +8799,23 @@ function enableEgoAutomation(sessionId) {
         return;
     }
     target.egoAutomationEnabled = true;
-    void rawCdp("egoAutomated.enable", {}, sessionId).catch(() => { });
+    // Linux port patch (carried from the pushed repo's sdk-only edit in
+    // 3d6f570, re-applied here at source level so a bundle rebuild keeps it):
+    // stock Chromium rejects the custom egoAutomated domain (it exists only
+    // in the original custom build). Fall back to a new-document script
+    // masking the automation signals that plain CDP attachment leaks into
+    // pages: modern Chromium sets navigator.webdriver whenever a DevTools
+    // client is attached, and the console.debug getter probe fires because
+    // Runtime.enable stays on. Sites such as Google sign-in block on these.
+    void rawCdp("egoAutomated.enable", {}, sessionId).catch(() => {
+        void rawCdp("Page.addScriptToEvaluateOnNewDocument", {
+            source: "Object.defineProperty(navigator,'webdriver',{get:()=>false,configurable:true});" +
+                "try{Object.defineProperty(console,'debug',{value:console.debug,writable:true,configurable:false});" +
+                "Object.defineProperty(console,'clear',{value:console.clear,writable:true,configurable:false});}catch(e){}" +
+                "if(!window.chrome){window.chrome={runtime:{}};}",
+            runImmediately: true,
+        }, sessionId).catch(() => { });
+    });
 }
 async function enablePageEvents(sessionId, timeoutMs = responseTimeoutMs()) {
     const targetId = sessionId ? sessionTargets.get(sessionId) : undefined;
