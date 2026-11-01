@@ -32,6 +32,7 @@ Verified against the upstream interface (October 2026, see `docs/implementation-
 | --- | --- |
 | `0.6.0.16-linux.1` (`VERSION`) | ego-lite macOS app `0.6.0.16` behavior + upstream SDK `0.1.0` |
 | `0.6.0.16-linux.2` (`VERSION`) | same app behavior line + upstream repo tag `v2.2.0-beta.5` (SDK package version still `0.1.0`); Linux port patch re-applied, see `docs/implementation-notes.zh-CN.md` |
+| `0.6.0.16-linux.3` (`VERSION`) | same app behavior line + upstream `dev` head `4471deb` (4 commits past `v2.2.0-beta.5`; SDK package version still `0.1.0`); Linux port patch re-applied, see `docs/implementation-notes.zh-CN.md` |
 | `-linux.N` suffix | Linux-port revision, bumped on every port-side change |
 
 This repository tracks upstream `citrolabs/ego-lite` and is updated when upstream changes.

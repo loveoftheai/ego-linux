@@ -7,6 +7,7 @@ import {
   ensureNetworkTracking,
   ensureSession,
   ensureFrameSessions,
+  responseTimeoutMs,
   invalidateSession,
   isCdpRequestTimeoutError,
   isPageUnresponsiveError,
@@ -217,6 +218,13 @@ class PageEvaluationTimeoutError extends Error {
   executionStopped;
   mayHaveLateEffects;
   pageResponsive;
+  /**
+   * A main-frame navigation that had not committed kept the Page from
+   * answering; it was stopped once the wait ran out and the Page answers
+   * again, showing `currentUrl`.
+   */
+  stopped = false;
+  currentUrl;
   constructor(message, {
     timeoutMs,
     executionStopped,
@@ -250,8 +258,16 @@ const SNAPSHOT_DOCUMENT_CHANGE_RETRIES = 2;
 const FILE_CHOOSER_OPEN_WAIT_MS = 1e3;
 const FILE_CHOOSER_SETTLE_MS = 50;
 const CONTROL_POLL_INTERVAL_MS = 2e4;
-const PAGE_EVALUATE_EXECUTION_TIMEOUT_MS = 14e3;
-const PAGE_EVALUATE_TRANSPORT_TIMEOUT_MS = 15e3;
+const PAGE_EVALUATE_EXECUTION_MARGIN_MS = 1e3;
+function pageEvaluateTransportTimeoutMs() {
+  return responseTimeoutMs();
+}
+function pageEvaluateExecutionTimeoutMs() {
+  return Math.max(
+    PAGE_EVALUATE_EXECUTION_MARGIN_MS,
+    pageEvaluateTransportTimeoutMs() - PAGE_EVALUATE_EXECUTION_MARGIN_MS
+  );
+}
 const PAGE_EVALUATE_HEALTH_TIMEOUT_MS = 250;
 const PAGE_EVALUATE_HEALTH_EXECUTION_TIMEOUT_MS = 200;
 const PAGE_EVALUATE_TERMINATE_TIMEOUT_MS = 1e3;
@@ -1258,7 +1274,7 @@ class Page {
       );
     }
     const page = await this.#resolve();
-    return this.#services.gate.withPage(page, async ({ sessionId }) => {
+    return this.#withPage(page, async ({ sessionId }) => {
       await this.#activate(page.targetId);
       let root;
       let rootContext;
@@ -1495,7 +1511,7 @@ ${overflow}`;
   }
   async info() {
     const page = await this.#resolve();
-    return this.#services.gate.withPage(page, async ({ sessionId }) => {
+    return this.#withPage(page, async ({ sessionId }) => {
       const dialog = this.#services.pendingDialog(sessionId);
       if (dialog) return { dialog };
       return evaluateInSession(
@@ -1592,7 +1608,8 @@ ${overflow}`;
                 this.#services,
                 sessionId,
                 "page.waitForFunction",
-                timeoutMs
+                timeoutMs,
+                this.label
               );
             }
             if (!isRetryablePageEvaluationError(error)) {
@@ -1628,7 +1645,7 @@ ${overflow}`;
     assertUrl(url);
     const { payload, saveAs } = pageFetchPayload(url, options);
     const page = await this.#resolve();
-    return this.#services.gate.withPage(page, async ({ sessionId }) => {
+    return this.#withPage(page, async ({ sessionId }) => {
       await this.#activate(page.targetId);
       const response = await evaluateInSession(
         this.#services,
@@ -1714,7 +1731,7 @@ ${overflow}`;
       assertAbsoluteFilePath(path, "page.screenshot path");
     }
     const page = await this.#resolve();
-    return this.#services.gate.withPage(page, async ({ sessionId }) => {
+    return this.#withPage(page, async ({ sessionId }) => {
       await this.#activate(page.targetId);
       return this.#services.screenshot(
         path,
@@ -1988,14 +2005,14 @@ ${overflow}`;
           expression,
           hasArgument,
           serializedArgument,
-          PAGE_EVALUATE_TRANSPORT_TIMEOUT_MS,
-          PAGE_EVALUATE_EXECUTION_TIMEOUT_MS
+          pageEvaluateTransportTimeoutMs(),
+          pageEvaluateExecutionTimeoutMs()
         );
       } catch (error) {
         if (isEvaluationExecutionDeadlineError(error)) {
           throw evaluationExecutionDeadlineError(
             "page.evaluate",
-            PAGE_EVALUATE_EXECUTION_TIMEOUT_MS
+            pageEvaluateExecutionTimeoutMs()
           );
         }
         if (isRuntimeEvaluateTransportTimeout(error)) {
@@ -2003,7 +2020,8 @@ ${overflow}`;
             this.#services,
             sessionId,
             "page.evaluate",
-            PAGE_EVALUATE_TRANSPORT_TIMEOUT_MS
+            pageEvaluateTransportTimeoutMs(),
+            this.label
           );
         }
         if (typeof expression === "function") {
@@ -2183,7 +2201,7 @@ ${overflow}`;
     });
   }
   async #runInputBoundary(page, operation) {
-    return this.#services.gate.withPage(page, async ({ sessionId }) => {
+    return this.#withPage(page, async ({ sessionId }) => {
       await this.#activate(page.targetId);
       return operation(sessionId);
     });
@@ -2207,7 +2225,7 @@ ${overflow}`;
         throw new Error("file chooser waiter belongs to a different Page");
       }
     }
-    return this.#services.gate.withPage(
+    return this.#withPage(
       page,
       async ({ sessionId }) => {
         await this.#activate(page.targetId);
@@ -2397,6 +2415,38 @@ ${overflow}`;
    * unresponsive Page is always reported with its label and recovery steps,
    * whichever step of an operation first ran into it.
    */
+  /**
+   * Run one public call on this Page. A renderer-bound command that the Page
+   * never answered is the same condition frame discovery reports as an
+   * unresponsive Page, so it is described the same way: the pending
+   * navigation is stopped and the error names the Page and what it shows.
+   */
+  async #withPage(page, operation, options = {}) {
+    let activeSessionId;
+    try {
+      return await this.#services.gate.withPage(
+        page,
+        (context) => {
+          activeSessionId = context.sessionId;
+          return operation(context);
+        },
+        options
+      );
+    } catch (error) {
+      if (!isCdpRequestTimeoutError(error) || isPageUnresponsiveError(error) || isBrowserLevelMethod(error.method)) {
+        throw error;
+      }
+      throw await this.#describeUnresponsivePage(
+        new PageUnresponsiveError(
+          error.method,
+          error.timeoutMs,
+          page.targetId,
+          error.sessionId ?? activeSessionId
+        ),
+        page
+      );
+    }
+  }
   async #frameSessions(page, timeoutMs) {
     try {
       return await this.#services.ensureFrameSessions(page.targetId, timeoutMs);
@@ -2445,32 +2495,8 @@ ${overflow}`;
     }
     return described;
   }
-  /**
-   * Stop whatever main-frame navigation keeps this Page from answering and
-   * read its main frame once it does. "hung" means the Page still answers
-   * nothing: a hung renderer, which Page.stopLoading cannot help.
-   */
   async #stopPendingNavigation(sessionId) {
-    try {
-      await this.#services.cdp(
-        "Page.stopLoading",
-        {},
-        sessionId,
-        PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS
-      );
-      const response = await this.#services.cdp(
-        "Page.getFrameTree",
-        {},
-        sessionId,
-        PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS
-      );
-      const frame = response?.result?.frameTree?.frame || response?.frameTree?.frame;
-      return {
-        ...typeof frame?.url === "string" && frame.url.length > 0 ? { url: frame.url } : {}
-      };
-    } catch {
-      return "hung";
-    }
+    return stopPendingNavigationInSession(this.#services, sessionId);
   }
   async #refMapForAction(page, sessionId, ...selectors) {
     if (!selectors.some((selector) => parseRef(selector))) {
@@ -2788,7 +2814,7 @@ function evaluationExecutionDeadlineError(apiName, timeoutMs) {
     }
   );
 }
-async function recoverPageEvaluationTimeout(services, sessionId, apiName, timeoutMs) {
+async function recoverPageEvaluationTimeout(services, sessionId, apiName, timeoutMs, label) {
   if (await pageEvaluationHealthProbe(services, sessionId)) {
     return new PageEvaluationTimeoutError(
       `${apiName} timed out after ${timeoutMs}ms while waiting for page JavaScript. The Page is responsive, but the evaluation is still pending and may produce late side effects. Reload or close the Page when that would be unsafe.`,
@@ -2823,8 +2849,23 @@ async function recoverPageEvaluationTimeout(services, sessionId, apiName, timeou
       }
     );
   }
+  const recovered = await stopPendingNavigationInSession(services, sessionId);
+  if (recovered !== "hung") {
+    const error = new PageEvaluationTimeoutError(
+      `${apiName}${label ? ` on Page ${label}` : ""} timed out after ${timeoutMs}ms: a main-frame navigation had started but not committed, so the Page answered nothing. It was stopped once that wait ran out, so the Page answers again${recovered.url ? ` and shows ${recovered.url}` : ""}; the evaluation may still run late on that document. Retry the call to continue on that document; to load the pending one, call page.goto(url, { timeout }) with a longer timeout, or continue on a new Page from task.newPage().`,
+      {
+        timeoutMs,
+        executionStopped: false,
+        mayHaveLateEffects: true,
+        pageResponsive: true
+      }
+    );
+    error.stopped = true;
+    error.currentUrl = recovered.url;
+    return error;
+  }
   return new PageEvaluationTimeoutError(
-    `${apiName} timed out after ${timeoutMs}ms and the Page is still unresponsive. Execution could not be confirmed stopped; reload or close the Page before continuing.`,
+    `${apiName}${label ? ` on Page ${label}` : ""} timed out after ${timeoutMs}ms and the Page is still unresponsive, even after Page.stopLoading, so its renderer is probably hung. Execution could not be confirmed stopped; continue on a new Page from task.newPage(), or close this Page and open it again.`,
     {
       timeoutMs,
       executionStopped: false,
@@ -2832,6 +2873,31 @@ async function recoverPageEvaluationTimeout(services, sessionId, apiName, timeou
       pageResponsive: false
     }
   );
+}
+async function stopPendingNavigationInSession(services, sessionId) {
+  try {
+    await services.cdp(
+      "Page.stopLoading",
+      {},
+      sessionId,
+      PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS
+    );
+    const response = await services.cdp(
+      "Page.getFrameTree",
+      {},
+      sessionId,
+      PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS
+    );
+    const frame = response?.result?.frameTree?.frame || response?.frameTree?.frame;
+    return {
+      ...typeof frame?.url === "string" && frame.url.length > 0 ? { url: frame.url } : {}
+    };
+  } catch {
+    return "hung";
+  }
+}
+function isBrowserLevelMethod(method) {
+  return method.startsWith("Target.") || method.startsWith("Browser.");
 }
 async function pageEvaluationHealthProbe(services, sessionId) {
   for (let attempt = 0; attempt < 2; attempt += 1) {

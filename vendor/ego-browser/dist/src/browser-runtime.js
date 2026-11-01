@@ -4,7 +4,11 @@ import {
   invokeEgo,
   isEgoUserControlError
 } from "./ego-errors.js";
-const RESPONSE_TIMEOUT_MS = 15e3;
+const DEFAULT_RESPONSE_TIMEOUT_MS = 15e3;
+function responseTimeoutMs() {
+  const configured = Number(process.env.EGO_BROWSER_RESPONSE_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_RESPONSE_TIMEOUT_MS;
+}
 const SESSION_SETUP_WAIT_MS = 2e3;
 const SESSION_TTL_MS = 2e3;
 const MAX_BUFFERED_EVENTS = 1e4;
@@ -346,7 +350,7 @@ function subscribePageEvents(targetId, listener) {
     if (listeners?.size === 0) pageEventSubscribers.delete(targetId);
   };
 }
-function rawCdp(method, params = {}, sessionId = void 0, timeoutMs = RESPONSE_TIMEOUT_MS) {
+function rawCdp(method, params = {}, sessionId = void 0, timeoutMs = responseTimeoutMs()) {
   const runtime = browserEgo();
   bindRuntimeCallbacks(runtime);
   const id = nextMessageId++;
@@ -387,7 +391,7 @@ function rawCdp(method, params = {}, sessionId = void 0, timeoutMs = RESPONSE_TI
     }
   });
 }
-async function browserCdp(method, params = {}, sessionId = void 0, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function browserCdp(method, params = {}, sessionId = void 0, timeoutMs = responseTimeoutMs()) {
   if (state.cdpOverride) {
     return state.cdpOverride(method, params, sessionId, timeoutMs);
   }
@@ -454,7 +458,7 @@ function recordCommandState(method, params, sessionId, response) {
     target.autoAttachEnabled = params?.autoAttach === true;
   }
 }
-async function ensureSession(requestedTargetId = void 0, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function ensureSession(requestedTargetId = void 0, timeoutMs = responseTimeoutMs()) {
   const cachedTargetId = requestedTargetId || state.preferredTargetId || defaultTargetId;
   const cached = cachedTargetId ? targetStates.get(cachedTargetId) : void 0;
   const setupWaitMs = Math.min(Math.max(1, timeoutMs), SESSION_SETUP_WAIT_MS);
@@ -515,7 +519,7 @@ async function ensureSession(requestedTargetId = void 0, timeoutMs = RESPONSE_TI
   })();
   return target.sessionInflight;
 }
-async function ensureFrameSessions(pageTargetId, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function ensureFrameSessions(pageTargetId, timeoutMs = responseTimeoutMs()) {
   if (typeof pageTargetId !== "string" || pageTargetId.length === 0) {
     throw new TypeError("ensureFrameSessions requires a non-empty targetId");
   }
@@ -714,7 +718,7 @@ function isNetworkDomainEnabled(sessionId) {
   const targetId = sessionId ? sessionTargets.get(sessionId) : void 0;
   return targetId ? Boolean(targetStates.get(targetId)?.networkDomainEnabled) : false;
 }
-async function ensureNetworkTracking(sessionIds, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function ensureNetworkTracking(sessionIds, timeoutMs = responseTimeoutMs()) {
   const unique = [...new Set(sessionIds.filter(Boolean))];
   await Promise.all(
     unique.map(
@@ -751,7 +755,7 @@ function networkActivity(sessionIds) {
   }
   return { tracking, inflight, lastActivityAt, pendingRequests };
 }
-async function pageNetworkSessions(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function pageNetworkSessions(sessionId, timeoutMs = responseTimeoutMs()) {
   const targetId = sessionTargets.get(sessionId);
   if (!targetId) {
     throw new Error(
@@ -866,7 +870,7 @@ function enableEgoAutomation(sessionId) {
   void rawCdp("egoAutomated.enable", {}, sessionId).catch(() => {
   });
 }
-async function enablePageEvents(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function enablePageEvents(sessionId, timeoutMs = responseTimeoutMs()) {
   const targetId = sessionId ? sessionTargets.get(sessionId) : void 0;
   const target = targetId ? targetStates.get(targetId) : void 0;
   if (!target || target.sessionId !== sessionId || target.pageEventsEnabled) {
@@ -887,7 +891,7 @@ async function enablePageEvents(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
   } catch {
   }
 }
-async function enableNetworkTrackingForSession(sessionId, required = false, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function enableNetworkTrackingForSession(sessionId, required = false, timeoutMs = responseTimeoutMs()) {
   const targetId = sessionId ? sessionTargets.get(sessionId) : void 0;
   const target = targetId ? targetStates.get(targetId) : void 0;
   if (!target || target.sessionId !== sessionId) {
@@ -923,7 +927,7 @@ async function enableNetworkTrackingForSession(sessionId, required = false, time
     );
   }
 }
-async function enableOopifAutoAttach(sessionId, timeoutMs = RESPONSE_TIMEOUT_MS) {
+async function enableOopifAutoAttach(sessionId, timeoutMs = responseTimeoutMs()) {
   const targetId = sessionId ? sessionTargets.get(sessionId) : void 0;
   const target = targetId ? targetStates.get(targetId) : void 0;
   if (!target || target.sessionId !== sessionId || target.autoAttachEnabled) {
@@ -1292,6 +1296,7 @@ export {
   pendingDialog,
   prepareFileChooser,
   releaseRuntimeCallbacks,
+  responseTimeoutMs,
   setPreferredTarget,
   subscribeBrowserEvents,
   subscribePageEvents

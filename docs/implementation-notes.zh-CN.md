@@ -208,3 +208,45 @@ Node 进程"一致）：
   旧 repo 产物未动；发布前须把 `sdk/` 物化为新 vendor bundle（见 README 布局节）。
 - 另见：`[ego-browser:notice]` 更新提示在 e2e 输出中出现，属旧有行为（repo
   FETCH_HEAD 领先于本地 port 提交，updateAvailable 为真），与 beta.5 无关。
+
+## 2026-11-01：同步上游 dev head 4471deb（beta.5 之后的 4 commits）
+
+目标选取说明（重要，与 cron 体字面规则的偏差已如实记录）：
+- 最新 beta tag 仍是 `v2.2.0-beta.5`（即基线本身），无新 tag。
+- `origin/main` HEAD `1240716`（2026-10-30）按提交日期虽晚于 beta.5，但它**不是
+  beta.5 的后代**（merge-base 为 2026-10-12 的 `cab9500`）：main 线仍停在
+  v2.1.0 发布线，其 SDK 内容反而更旧（skill 指南 v2.1.0、page-model 等大段
+  回退）。按字面“取 main 与 beta tag 中日期较新者”同步 main 会把 port 从
+  beta.5 降级回 v2.1.0，故不采用。
+- beta.5 所在的真正后继线是 `origin/dev`：`4471deb`（2026-10-30，Merge PR
+  #612）是 beta.5 的直系后代（`ceeedd6..origin/dev` 共 4 commits），本次即以
+  它为同步目标。dev head 尚未打新 tag，下次若出现 `v2.2.0-beta.6` 或更新 tag
+  应以 tag 为准复核。
+
+上游行为变化（只列影响本 port 的；其余为 CI/文档/lefthook）：
+- pending navigation：`evaluate()` 与 `screenshot()` 在 Page 长时间无响应时也
+  走与其它公开调用相同的处理——停止待定导航后以带 `stopped`/`currentUrl` 的
+  错误报告（evaluate 为 `EGO_PAGE_EVALUATION_TIMED_OUT`，screenshot 等为
+  `EGO_PAGE_UNRESPONSIVE`）；浏览器级方法（`Target.*`/`Browser.*`）超时不被
+  误判为 Page 无响应。Skill 指南补了一句 evaluate 的对应说明。
+- 响应超时：`browser-runtime.ts` 的 15s 固定超时改为 `responseTimeoutMs()`，
+  默认仍 15s，仅测试可用 `EGO_BROWSER_RESPONSE_TIMEOUT_MS` 覆盖；evaluate
+  的执行超时改为传输超时减 1s（原固定 14s/15s，行为等价）。
+- 其余为 e2e 用例/指纹脚本与构建脚本的复用构建标志
+  （`EGO_BROWSER_REUSE_BUILD`，本次构建未设置，走完整构建）。
+- 公共 API 无新增方法；原生绑定面（`ego.*`）无变化。
+
+本 port 的改动：
+- `vendor/ego-browser/dist/`（out + src + scripts）与
+  `vendor/ego-browser/skill-body/SKILL.md` 从 dev head 源码重建并同步；相对
+  beta.5 bundle 仅 6 个文件变化（`dist/out/index.js`、
+  `dist/src/browser-runtime.js`、`dist/src/page-model.js`、
+  `dist/out/ego-browser/SKILL.md` 及 macos/windows 变体、
+  `skill-body/SKILL.md`）；SDK package 版本仍为 `0.1.0`。
+- Linux port patch 未被上游取代、已重打到 dev head：上游
+  `runtimeInstanceId()` 仍是 ppid 推导，`EGO_BROWSER_INSTANCE_ID` 优先分支
+  与旧 patch 逐字相同（构建产物已含该分支，bundle 与 transpiled src 均核对）。
+- `src/*.js` 绑定层、launcher CLI 表面均无需改动：新行为全部走 SDK bundle
+  内 + 已有 CDP 转发（`Page.stopLoading`/`Page.getFrameTree`/
+  `Runtime.evaluate` 均为旧有转发方法）。
+- VERSION：`0.6.0.16-linux.3`（package.json 同步）。
