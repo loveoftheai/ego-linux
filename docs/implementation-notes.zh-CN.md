@@ -277,3 +277,38 @@ Node 进程"一致）：
   与本地基线逐文件比对，远端单方面新增的修改必须先合入本地再推，杜绝
   “整树覆盖式推送丢修改”重演。
 - VERSION：`0.6.0.16-linux.4`（package.json 同步）；其余内容与 linux.3 相同。
+
+## 2026-11-03（每日同步）：linux.5——上游 dev 头 b201124（SDK 侧纯文档变化）
+
+判定（沿用 2026-11-01 的 dev 线先例，不照搬字面规则）：最新 beta tag 仍是
+`v2.2.0-beta.5`（基线本身），`origin/main` HEAD 仍是 `1240716`（2026-10-30，
+SDK 停在 v2.1.0 线，不是 beta.5 的后代，同步它等于降级，故不采用）。真正
+的后继仍是 `origin/dev`，本次从 `4471deb` 前进到 `b201124`（2026-11-02，
+Merge PR #638）。
+
+上游变化（`4471deb..b201124`，共 41 文件）：大头是新增 `tools/linear-autofix`
+（无人值守 Linear→PR→评审循环工具，不属于 port，不同步）；SDK 侧
+`package/ego-browser` 只有文档与测试变化，无 `.ts` 行为改动、公共 API 无新增、
+绑定层无需改动：
+- `skill-body/SKILL.md`：新增 screenshot 约 15s 后 `EGO_PAGE_UNRESPONSIVE`
+  的说明（至多重试一次；canvas 走 `toDataURL` 读像素）与 handOff 适用范围
+  收紧（无用户给出的凭证的登录、CAPTCHA/人工验证、2FA 等手动步骤；不猜
+  凭证、不静默绕过）；
+- `skills/ego-browser/references/clearing-state.md`：登录墙本身不再是清
+  除站点的理由，改为 handOff 让用户登录；
+- 其余为 e2e runner 与 skill-package/page-model 测试。
+
+Port 侧：
+- 两处 Linux 补丁在新源码上逐字重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支；`browser-runtime.ts` 的
+  `enableEgoAutomation()` masking 回退），打完后源码与 linux.4 的带补丁源码
+  逐字节一致（上游这两处函数本身未变）；bundle 与 transpiled src 均核对含
+  两处分支。
+- `vendor/ego-browser/dist` 与 `skill-body/SKILL.md` 从新 worktree 全量同步；
+  SDK package version 仍 `0.1.0`，port `package.json` 不变。
+- 推前远端比对：远端 HEAD 仍是 linux.4（`c3512a1f`），除 `sdk/`（本地为指向
+  clone 旧 dist 的符号链接，staging 物化时绕过）与排除目录外，本地树与远端
+  逐文件一致，无远端单方面修改需要合入。注意：本地 `sdk` 符号链接目前指向
+  `../repo/package/ego-browser/dist/out`（旧版 dist），不要直接用它验证，
+  一律以 staging 物化产物为准。
+- VERSION：`0.6.0.16-linux.5`。

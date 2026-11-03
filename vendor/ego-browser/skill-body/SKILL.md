@@ -395,6 +395,12 @@ it at scale. Canvas-backed editors may not expose visible content through DOM
 text or selectors; verify those results with a screenshot or an
 application-specific visible state.
 
+`page.screenshot()` can sometimes fail after about 15s with
+`EGO_PAGE_UNRESPONSIVE` on `Page.captureScreenshot`, even if `page.evaluate()`
+still works. Retry at most once. For a canvas, read its pixels through
+`page.evaluate()` with `canvas.toDataURL("image/png")` (tainted canvases throw;
+WebGL may read blank).
+
 ### Page JavaScript and CDP
 
 Use `page.evaluate()` for bulk extraction or complex in-page work. It accepts
@@ -525,9 +531,11 @@ Stop when the user takes control or the space is inactive or unassigned. Do not
 retry or route around the stop. Permission prompts, device choosers, and
 other browser-owned prompts require the user to handle them.
 
-When the user must act in the browser, call `await task.handOff()`, end the
-round, and explain what they should do. After the user confirms, resume the
-same space:
+When the user must act in the browser (login without credentials the user gave,
+CAPTCHA or human verification, 2FA, or other manual step), call
+`await task.handOff()`, end the round, and explain what they should do. Do not
+guess credentials or work around it silently.
+After the user confirms, resume the same space:
 
 ```js
 const task = await takeOverTaskSpace(7);
