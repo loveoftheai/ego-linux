@@ -1537,7 +1537,11 @@ ${overflow}`;
     const hasArgument = arguments.length >= 2;
     return this.#evaluate(expression, hasArgument, argument, true);
   }
-  /** Wait until a Page expression returns a truthy value. */
+  /**
+   * Wait until a Page expression returns a truthy value. Resolves to `true`,
+   * not that value, and throws on timeout; read Page state afterwards with
+   * `page.evaluate()`.
+   */
   async waitForFunction(expression, argument, options = {}) {
     if (arguments.length === 2 && typeof expression === "function" && expression.length === 0 && looksLikeWaitForFunctionOptions(argument)) {
       const signature = publicApiEntry("Page.waitForFunction")?.signature;

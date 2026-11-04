@@ -340,6 +340,12 @@ const USER_CONTROL_REASON_MESSAGES = Object.freeze({
     serial: userPromptGuidance("A browser port chooser for serial access has appeared."),
     hid: userPromptGuidance("A browser device chooser for HID has appeared."),
     protocol_handler: permissionPrompt("protocol handler registration"),
+    clipboard: permissionPrompt("clipboard access"),
+    local_network_access: permissionPrompt("local network access"),
+    storage_access: permissionPrompt("storage access"),
+    window_management: permissionPrompt("window management"),
+    local_fonts: permissionPrompt("local font access"),
+    permission_prompt: userPromptGuidance("A browser permission prompt or device chooser has appeared."),
     manual_takeover: USER_CONTROL_GUIDANCE,
 });
 function permissionPrompt(access) {
@@ -7081,7 +7087,7 @@ const PUBLIC_API_SCHEMA = [
     {
         name: "Page.waitForFunction",
         signature: "await page.waitForFunction(fnOrString, argument?, { timeout?, polling? })",
-        summary: "Wait until a Page function or expression returns a truthy value.",
+        summary: "Wait until a Page function or expression returns a truthy value; resolves to true, not that value, and throws on timeout. Read Page state afterwards with page.evaluate().",
         options: {
             timeout,
             polling: option("positiveMilliseconds", "Polling interval in milliseconds; defaults to 100."),
@@ -19897,7 +19903,11 @@ class Page {
         const hasArgument = arguments.length >= 2;
         return this.#evaluate(expression, hasArgument, argument, true);
     }
-    /** Wait until a Page expression returns a truthy value. */
+    /**
+     * Wait until a Page expression returns a truthy value. Resolves to `true`,
+     * not that value, and throws on timeout; read Page state afterwards with
+     * `page.evaluate()`.
+     */
     async waitForFunction(expression, argument, options = {}) {
         if (arguments.length === 2 &&
             typeof expression === "function" &&

@@ -312,3 +312,30 @@ Port 侧：
   `../repo/package/ego-browser/dist/out`（旧版 dist），不要直接用它验证，
   一律以 staging 物化产物为准。
 - VERSION：`0.6.0.16-linux.5`。
+
+## 2026-11-04（每日同步）：linux.6——上游 dev 头 bbd103c（权限提示命名 + waitForFunction 文档化）
+
+判定（沿用 2026-11-01 的 dev 线先例）：最新 beta tag 仍是 `v2.2.0-beta.5`，
+`origin/main` HEAD 仍是 `1240716`（2026-10-30，同步它等于降级，不采用）。
+目标为 `origin/dev` HEAD `bbd103c`（2026-11-03，Merge PR #649）。
+
+上游变化（`b201124..bbd103c`，共 13 文件）：`tools/linear-autofix` 的
+dry-run 状态隔离（不属于 port，不同步）；SDK 侧 `package/ego-browser`：
+- `ego-errors.ts`：user-control 原因新增 clipboard、local_network_access、
+  storage_access、window_management、local_fonts、permission_prompt 六个命名
+  （`permission_prompt` 兜底无专属键的提示/选择器；`manual_takeover` 明确不
+  用于权限提示），附测试；
+- `page-model.ts` / `public-api-schema.ts` / `skill-body/SKILL.md`：
+  `waitForFunction` 文档化为 resolves to `true`（非谓词返回值）、超时抛错，
+  读状态改用 `page.evaluate()`，附测试；实现本身无行为改动；
+- `docs/native-bindings-api.md`：权限键表同步新增上述六项。
+绑定层无需改动（无新 API、无行为改动）。
+
+Port 侧：
+- 两处 Linux 补丁在新源码上逐字重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支，上游仍从 ppid 派生，未变；
+  `browser-runtime.ts` 的 `enableEgoAutomation()` masking 回退），打完后源码
+  与 linux.5 的带补丁源码之差恰好等于上游改动；bundle 核对含两处分支。
+- `vendor/ego-browser/dist` 与 `skill-body/SKILL.md` 从新 worktree 全量同步；
+  SDK package version 仍 `0.1.0`，port `package.json` 不变。
+- VERSION：`0.6.0.16-linux.6`。

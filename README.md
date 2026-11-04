@@ -35,6 +35,7 @@ Verified against the upstream interface (October 2026, see `docs/implementation-
 | `0.6.0.16-linux.3` (`VERSION`) | same app behavior line + upstream `dev` head `4471deb` (4 commits past `v2.2.0-beta.5`; SDK package version still `0.1.0`); Linux port patch re-applied, see `docs/implementation-notes.zh-CN.md` |
 | `0.6.0.16-linux.4` (`VERSION`) | linux.3 + Justin's `3d6f570` CDP-masking fallback re-applied at SDK source level (was lost in the linux.3 bundle rebuild, which only touched `sdk/index.js` in his commit); see `docs/implementation-notes.zh-CN.md` |
 | `0.6.0.16-linux.5` (`VERSION`) | linux.4 + upstream `dev` head `b201124` (docs only for the SDK: SKILL.md screenshot-timeout/canvas fallback + handOff scope notes, clearing-state.md handoff wording; SDK package version still `0.1.0`); Linux port patches re-applied at source level, see `docs/implementation-notes.zh-CN.md` |
+| `0.6.0.16-linux.6` (`VERSION`) | linux.5 + upstream `dev` head `bbd103c` (PR #649 dry-run state + PR #645 named permission prompts: clipboard/local-network/storage-access/window-management/local-fonts/permission-prompt; SKILL.md + `waitForFunction` resolves-to-`true` documentation; SDK package version still `0.1.0`); Linux port patches re-applied at source level, see `docs/implementation-notes.zh-CN.md` |
 | `-linux.N` suffix | Linux-port revision, bumped on every port-side change |
 
 This repository tracks upstream `citrolabs/ego-lite` and is updated when upstream changes.
