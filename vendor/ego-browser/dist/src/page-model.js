@@ -23,7 +23,7 @@ import {
   subscribeBrowserEvents,
   subscribePageEvents
 } from "./browser-runtime.js";
-import { runtimeValue } from "./cdp-eval.js";
+import { assertNoSessionIdInParams, runtimeValue } from "./cdp-eval.js";
 import { withTemporaryClipboardText } from "./clipboard.js";
 import {
   captureScreenshotForSession,
@@ -3101,6 +3101,12 @@ function assertCdpCall(apiName, method, params, options) {
   if (!params || typeof params !== "object" || Array.isArray(params)) {
     throw new TypeError("cdp params must be an object");
   }
+  assertNoSessionIdInParams(
+    apiName,
+    method,
+    params,
+    `${apiName} selects its own session and cannot route to another one.`
+  );
   validatePublicApiOptions(apiName, options);
 }
 async function waitForTargetToDisappear(services, targetId, timeoutMs) {

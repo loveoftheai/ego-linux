@@ -1,6 +1,11 @@
 import { cdp, js } from "../cdp-eval.js";
 import { browserCdp } from "../browser-runtime.js";
-import { buildSelectorCenterJs, isRawSelector } from "../element-resolver.js";
+import {
+  buildFindElementJs,
+  ElementResolutionError,
+  isRawSelector
+} from "../element-resolver.js";
+import { CLICK_POINT_HELPERS } from "./action-target.js";
 import { elementCenter } from "./observe.js";
 import { resolveAndCall } from "./element-ops.js";
 const INPUT_EVENT_DELAY_MS = 0;
@@ -120,17 +125,58 @@ async function resolveClickTarget(target) {
     const point2 = await resolveRawSelectorClickTarget(target);
     if (point2) return point2;
   }
-  const point = await resolveMouseTarget(target);
+  const point = await resolveElementClickPoint(target);
   return { ...point, probeId: await installClickProbe(point) };
+}
+async function resolveElementClickPoint(target) {
+  const point = await resolveMouseTarget(target);
+  const selector = typeof target === "string" ? target : target && typeof target === "object" && "selector" in target ? target.selector : "";
+  if (!selector || await pointInViewport(point)) return point;
+  const offset = typeof target === "object" && "selector" in target && (target.x !== void 0 || target.y !== void 0) ? { x: numberValue(target.x), y: numberValue(target.y) } : null;
+  const { result, sessionId } = await resolveAndCall(
+    selector,
+    `function(offset){${CLICK_POINT_HELPERS}
+      return clickPointForElement(this, offset);
+    }`,
+    [offset]
+  );
+  const value = result.result?.value;
+  if (value?.error) throw clickPointError(selector, value.error);
+  if (typeof value?.x !== "number" || typeof value?.y !== "number") {
+    throw clickPointError(selector, "element position is unavailable");
+  }
+  return { x: value.x, y: value.y, sessionId };
+}
+async function pointInViewport(point) {
+  const { x, y } = point;
+  const result = await cdp(
+    "Runtime.evaluate",
+    {
+      expression: `${x} >= 0 && ${y} >= 0 && ${x} < innerWidth && ${y} < innerHeight`,
+      returnByValue: true,
+      awaitPromise: false
+    },
+    point.sessionId
+  );
+  return result.result?.value !== false;
+}
+function clickPointError(selector, reason) {
+  return new ElementResolutionError(
+    `click failed: ${reason}: ${selector}`,
+    "transient"
+  );
 }
 async function resolveRawSelectorClickTarget(selector) {
   if (!isRawSelector(selector)) return null;
   const id = newProbeId("click");
   const expression = `(() => {
-    const center = ${buildSelectorCenterJs(selector)};
-    if (!center) return null;
-    ${clickProbeInstallJs(id, "center")}
-    return { x: center.x, y: center.y };
+    ${CLICK_POINT_HELPERS}
+    const element = ${buildFindElementJs(selector)};
+    if (!element) return null;
+    const point = clickPointForElement(element, null);
+    if (point.error) return point;
+    ${clickProbeInstallJs(id, "point")}
+    return { x: point.x, y: point.y };
   })()`;
   const result = await cdp("Runtime.evaluate", {
     expression,
@@ -139,6 +185,7 @@ async function resolveRawSelectorClickTarget(selector) {
   });
   if (result.exceptionDetails) return null;
   const value = result.result?.value;
+  if (value?.error) throw clickPointError(selector, value.error);
   if (typeof value?.x !== "number" || typeof value?.y !== "number") {
     return null;
   }

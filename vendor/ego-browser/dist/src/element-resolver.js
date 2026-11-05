@@ -2114,7 +2114,7 @@ function send(cdp, method, params = {}, sessionId = void 0) {
 }
 export {
   ElementResolutionError,
-  buildSelectorCenterJs,
+  buildFindElementJs,
   isRawSelector,
   resolveElementCenter,
   resolveElementObjectId,

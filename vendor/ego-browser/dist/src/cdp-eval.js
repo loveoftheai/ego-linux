@@ -3,11 +3,29 @@ import { browserCdp } from "./browser-runtime.js";
 import { state } from "./state.js";
 let hasWarnedAboutFunctionJs = false;
 async function cdp(method, params = {}, sessionId = void 0) {
+  assertNoSessionIdInParams(
+    "cdp",
+    method,
+    params,
+    "Pass it as the third argument: cdp(method, params, sessionId)."
+  );
   const result = state.cdpOverride ? await state.cdpOverride(method, params, sessionId) : (await browserCdp(method, params, sessionId)).result || {};
   if (!sessionId && (method === "Network.enable" || method === "Network.disable")) {
     state.networkDomainEnabled = method === "Network.enable";
   }
   return result;
+}
+const COMMANDS_WITH_SESSION_ID_PARAM = /* @__PURE__ */ new Set([
+  "Target.detachFromTarget",
+  "Target.sendMessageToTarget"
+]);
+function assertNoSessionIdInParams(apiName, method, params, remedy) {
+  if (params?.sessionId === void 0 || COMMANDS_WITH_SESSION_ID_PARAM.has(method)) {
+    return;
+  }
+  throw new TypeError(
+    `${apiName}: ${method} does not take sessionId in params; it would be ignored and the command would run in the wrong session. ${remedy}`
+  );
 }
 async function js(expression, targetId = void 0) {
   if (typeof expression === "function") {
@@ -138,6 +156,7 @@ function containsOuterReturn(node) {
   );
 }
 export {
+  assertNoSessionIdInParams,
   cdp,
   decodeUnserializableJsValue,
   hasReturnStatement,

@@ -1,4 +1,4 @@
-[ego-browser:skill] ego-browser usage guide v2.2.0 (macos)
+[ego-browser:skill] ego-browser usage guide v2.2.1 (macos)
 
 # ego-browser
 
@@ -19,21 +19,13 @@ console.log(await page.snapshot());
 EOF
 ```
 
-When a sandbox blocks heredoc input, use `-e` instead. Use single quotes around the code and double quotes for JavaScript strings; single quotes within the code require shell quoting.
-
-```bash
-ego-browser nodejs -e '
-const task = await taskSpace("inspect example page");
-await task.page("p1").goto("https://example.com");
-console.log(task.spaceId);
-'
-```
+When a sandbox blocks heredoc input, use `ego-browser nodejs -e '<code>'` instead. Use single quotes around the code and double quotes for JavaScript strings; single quotes within the code require shell quoting.
 
 The script always runs in Node.js, not in the web Page. Browser helpers and Node.js APIs belong in the script; Page globals such as `window`, `document`, `location`, and DOM APIs do not. Put browser-side JavaScript inside `page.evaluate()`. Do not import Playwright or launch another browser.
 
 The Node.js runtime uses ESM. When a script needs local files, load built-ins with dynamic imports such as `await import("node:fs/promises")`. The script does not run in your shell's working directory, so use absolute paths for every file it reads or writes. It also does not inherit your shell's environment variables: `process.env` will not contain values you set before running `ego-browser`, so write every input directly into the script.
 
-Ego-browser deliberately exposes a small custom API. It is not Playwright, even where method names and options look similar. Use only the TaskSpace, Page, FileChooser, mouse, and keyboard APIs explicitly listed in this Skill. Do not infer Playwright methods such as `locator()`, `getByRole()`, `context()`, `expect()`, or `route()`. When the listed API does not cover an operation, use the documented `page.evaluate()` or `page.cdp()` escape hatches instead of guessing another method.
+Ego-browser exposes a small custom API. It is not Playwright, even where names and options look similar. Use only the TaskSpace, Page, FileChooser, mouse, and keyboard APIs listed in this Skill. Do not infer methods such as `locator()`, `getByRole()`, `context()`, `expect()`, or `route()`. When the listed API does not cover an operation, use `page.evaluate()` or `page.cdp()` instead of guessing another method.
 
 Only these pointer actions accept an optional `label` option: `click()`, `dblclick()`, `hover()`, `dragAndDrop()`, `mouse.click()`, `mouse.move()`, and `mouse.wheel()`. Pass a concise 3-6 word description to keep the action text next to the visible agent cursor in sync with the action. Other methods, such as `fill()`, `press()`, `focus()`, `selectOption()`, `waitForSelector()`, `keyboard.*()`, `mouse.down()`, and `mouse.up()`, reject a `label` option. The `label` in `selectOption(selector, { label })` is different: it selects the option whose visible text matches.
 
@@ -67,9 +59,7 @@ Supported TaskSpace API:
 
 Pages receive permanent labels such as `p1`, `p2`, and `p3`. Prefer these labels to custom `{ as }` values. Reuse or close Pages as the task proceeds; the runtime reports the configured Page budget when it is reached.
 
-`task.newPage()` creates another blank Page when multiple Pages must stay open. Navigate it separately with `page.goto()`.
-
-`task.page(label)` only refers to a Page that already exists; it never creates one, and its handle is always truthy, so `task.page("p2") || await task.newPage()` and `if (!page)` do not detect a missing label. Use labels printed by earlier output or by `await task.pages()`, and call `await task.newPage()` to create one.
+`task.page(label)` only refers to a Page that already exists; it never creates one, and its handle is always truthy, so `task.page("p2") || await task.newPage()` and `if (!page)` do not detect a missing label. Use labels printed by earlier output or by `await task.pages()`. When multiple Pages must stay open, call `await task.newPage()` for another blank Page and navigate it with `goto()`.
 
 `await task.pages()` returns managed Pages. `await task.tabs()` returns every tab in the space as `{ label?, page, targetId, title, url, active, openedBy }`. A tab without a label is unmanaged; adopt it before operating:
 
@@ -85,7 +75,7 @@ if (active && !active.label) {
 
 ## Page operations
 
-ego-browser provides the following Page API:
+Page API:
 
 - State and observation: `label`, `spaceId`, `openedBy`, `targetId`, `url()`, `title()`, `info()`, `snapshot()`, `screenshot()`
 - Navigation and waits: `goto()`, `reload()`, `waitForURL()`, `waitForEvent()`, `waitForSelector()`, `waitForLoadState()`, `waitForFunction()`, `waitForTimeout()`
@@ -93,7 +83,7 @@ ego-browser provides the following Page API:
 - Dialogs: `acceptDialog(promptText?)`, `dismissDialog()`
 - Pointer: `mouse.click()`, `move()`, `down()`, `up()`, `wheel()`
 - Keyboard: `keyboard.down()`, `up()`, `press()`, `type()`, `insertText()`, `paste()`
-- Page code and protocols: `evaluate(fnOrString, argument)`, `fetch(url, options)`, `cdp(method, params, options)`
+- Page code and protocols: `evaluate(fnOrString, argument)`, `fetch(url, options)`, `cdp(method, params, options)`, `events()`
 
 `page.evaluate()` callbacks run only inside the Page; they cannot read variables or Node.js modules from the surrounding script. Define browser-side helpers inside the callback or pass one JSON-serializable value as its second argument.
 
@@ -125,12 +115,6 @@ Use the refs returned by the subtree for actions inside the iframe. A subtree sn
 
 ```js
 await page.waitForFunction(() => window.ready, undefined, { timeout: 5000 });
-```
-
-```js
-// Round 1: inspect and choose targets from this output.
-const page = task.page("p1");
-console.log(await page.snapshot());
 ```
 
 ```js
@@ -186,20 +170,13 @@ Inspect the screenshot with an image-viewing tool. Coordinates use CSS pixels; k
 
 On macOS and Windows, `keyboard.paste()` sends the native paste shortcut and then restores the user's clipboard. Pass `{ text, html }` when a rich editor needs structured clipboard content; `text` is the plain-text fallback. On other platforms, use `keyboard.insertText()` for plain text.
 
-```js
-await page.keyboard.paste({
-  text: "Name\tStatus",
-  html: "<table><tr><td>Name</td><td>Status</td></tr></table>",
-});
-```
-
 For rich-text editors and editable grids, validate a small edit before repeating it at scale. Canvas-backed editors may not expose visible content through DOM text or selectors; verify those results with a screenshot or an application-specific visible state.
 
 `page.screenshot()` can sometimes fail after about 15s with `EGO_PAGE_UNRESPONSIVE` on `Page.captureScreenshot`, even if `page.evaluate()` still works. Retry at most once. For a canvas, read its pixels through `page.evaluate()` with `canvas.toDataURL("image/png")` (tainted canvases throw; WebGL may read blank).
 
 ### Page JavaScript and CDP
 
-Use `page.evaluate()` for bulk extraction or complex in-page work. It accepts one JSON-serializable argument and returns a JSON-serializable value:
+Use `page.evaluate()` for bulk extraction or complex in-page work. It returns a JSON-serializable value:
 
 ```js
 const rows = await page.evaluate(
@@ -214,7 +191,7 @@ const rows = await page.evaluate(
 
 `page.evaluate()` has no timeout option. Keep long work in bounded calls; on a safety timeout, use `executionStopped` and `mayHaveLateEffects` to decide whether an unsafe follow-up requires reloading or closing the Page first.
 
-Use documented Page methods first. If a wrapper is missing or does not work reliably on the current page, use `page.cdp()` as a lower-level path for diagnosis or control. It accepts Page, Runtime, DOM, Network, Input, and similar commands; use `task.cdp()` for Target and Browser commands. Raw CDP invalidates refs. Do not persist `page.targetId` across rounds.
+Use documented Page methods first. If a wrapper is missing or does not work reliably on the current page, use `page.cdp()` as a lower-level path for diagnosis or control. It accepts Page, Runtime, DOM, Network, Input, and similar commands; use `task.cdp()` for Target and Browser commands. Both reject a misplaced `sessionId` in params. Raw CDP invalidates refs. Do not persist `page.targetId` across rounds.
 
 ## Action receipts, popups, and dialogs
 
@@ -228,8 +205,6 @@ await popupPage.waitForLoadState();
 ```
 
 High-level actions also report immediately observed popups in `receipt.popups` as `{ label, targetId }`. Resolve the Page with `task.page(receipt.popups[0].label)` and continue there; wait for its URL when the destination matters.
-
-For uncommon protocol-event workflows, `await page.events()` returns and clears the buffered event array; it is not an EventEmitter.
 
 Page sessions hide page console messages from CDP so sites cannot detect the automation. To read `Runtime.consoleAPICalled` while debugging, first call `await page.cdp("egoAutomated.disable")`, then `page.cdp("Runtime.enable")`. Sites can detect CDP again while it is off.
 
@@ -335,4 +310,4 @@ If the final output contains `[ego-browser:notice]`, finish the current browser 
 
 Before clearing any cookie, cache, or storage, read `references/clearing-state.md` in the ego-browser Skill directory. Some clears reach the whole browser profile.
 
-[ego-browser:skill] end of guide v2.2.0
+[ego-browser:skill] end of guide v2.2.1

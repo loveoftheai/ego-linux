@@ -231,6 +231,41 @@ const SCROLL_TARGET_HELPERS = `
   ${COMPOSED_PARENT_HELPER}
   ${SCROLL_TARGET_FUNCTIONS}
 `;
+const CLICK_POINT_HELPERS = `
+  ${SCROLL_TARGET_HELPERS}
+  function clickPointForElement(element, offset) {
+    const view = element.ownerDocument.defaultView;
+    const inViewport = (point, owner) =>
+      point.x >= 0 && point.y >= 0 &&
+      point.x < owner.innerWidth && point.y < owner.innerHeight;
+    const inputPoint = (point) => {
+      if (!point || !inViewport(point, view)) return null;
+      let { x, y } = point;
+      let current = view;
+      while (current.frameElement) {
+        const owner = current.frameElement;
+        const rect = owner.getBoundingClientRect();
+        x += rect.left + owner.clientLeft;
+        y += rect.top + owner.clientTop;
+        current = current.parent;
+      }
+      return inViewport({ x, y }, current) ? { x, y } : null;
+    };
+    const elementPoint = () => {
+      const rect = element.getBoundingClientRect();
+      return offset
+        ? { x: rect.x + offset.x, y: rect.y + offset.y }
+        : { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    };
+    const unscrolled = inputPoint(elementPoint());
+    if (unscrolled) return unscrolled;
+    element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    const point =
+      inputPoint(elementPoint()) ||
+      (offset ? null : inputPoint(actionPointForElement(element)));
+    return point || { error: "element is not visible in the viewport" };
+  }
+`;
 const ENABLED_SCROLL_TARGET_HELPERS = `
   ${ACTION_TARGET_STATE_HELPERS}
   ${SCROLL_TARGET_FUNCTIONS}
@@ -400,6 +435,7 @@ const HIT_TARGET_HELPERS = `
 `;
 export {
   ACTION_TARGET_STATE_HELPERS,
+  CLICK_POINT_HELPERS,
   COMPOSED_PARENT_HELPER,
   COMPOSED_TREE_HELPERS,
   EDIT_ACTION_TARGET_HELPERS,

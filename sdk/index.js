@@ -9271,11 +9271,12 @@ let hasWarnedAboutFunctionJs = false;
 /**
  * Send a raw Chrome DevTools Protocol command.
  * @param {string} method CDP method name, for example Runtime.evaluate.
- * @param {object} [params] CDP command parameters.
- * @param {string} [sessionId] Optional attached target session id.
+ * @param {object} [params] CDP command parameters. A sessionId here is rejected, except on Target commands that define it.
+ * @param {string} [sessionId] Optional attached target session id. Defaults to the current page session.
  * @returns {Promise<object>} CDP result object.
  */
 async function cdp(method, params = {}, sessionId = undefined) {
+    assertNoSessionIdInParams("cdp", method, params, "Pass it as the third argument: cdp(method, params, sessionId).");
     const result = state.cdpOverride
         ? await state.cdpOverride(method, params, sessionId)
         : (await browserCdp(method, params, sessionId)).result || {};
@@ -9287,6 +9288,23 @@ async function cdp(method, params = {}, sessionId = undefined) {
         state.networkDomainEnabled = method === "Network.enable";
     }
     return result;
+}
+// The only CDP commands whose protocol parameters include sessionId.
+const COMMANDS_WITH_SESSION_ID_PARAM = new Set([
+    "Target.detachFromTarget",
+    "Target.sendMessageToTarget",
+]);
+/**
+ * A session is selected by the CDP message envelope, not by params. Chromium
+ * ignores an unknown params.sessionId, so the command would run in the default
+ * session and return a plausible result from the wrong target.
+ */
+function assertNoSessionIdInParams(apiName, method, params, remedy) {
+    if (params?.sessionId === undefined ||
+        COMMANDS_WITH_SESSION_ID_PARAM.has(method)) {
+        return;
+    }
+    throw new TypeError(`${apiName}: ${method} does not take sessionId in params; it would be ignored and the command would run in the wrong session. ${remedy}`);
 }
 /**
  * Evaluate JavaScript in the current page or a target tab.
@@ -9707,6 +9725,52 @@ const SCROLL_TARGET_FUNCTIONS = `
 const SCROLL_TARGET_HELPERS = `
   ${COMPOSED_PARENT_HELPER}
   ${SCROLL_TARGET_FUNCTIONS}
+`;
+/**
+ * Browser-side point for the v1 `click()` helper. A point already inside the
+ * viewport is kept. Otherwise the element is scrolled to the viewport center;
+ * if it cannot get there (fixed position, end of the scroll range), a click
+ * without a caller-chosen offset settles for its visible part. A point that is
+ * still outside is reported, because input dispatched there hits nothing.
+ *
+ * Input goes to the session's top viewport, so a point in a same-process iframe
+ * is translated out of it and has to be visible in both. `frameElement` is null
+ * across an origin boundary, where a separate session owns the frame's input.
+ */
+const CLICK_POINT_HELPERS = `
+  ${SCROLL_TARGET_HELPERS}
+  function clickPointForElement(element, offset) {
+    const view = element.ownerDocument.defaultView;
+    const inViewport = (point, owner) =>
+      point.x >= 0 && point.y >= 0 &&
+      point.x < owner.innerWidth && point.y < owner.innerHeight;
+    const inputPoint = (point) => {
+      if (!point || !inViewport(point, view)) return null;
+      let { x, y } = point;
+      let current = view;
+      while (current.frameElement) {
+        const owner = current.frameElement;
+        const rect = owner.getBoundingClientRect();
+        x += rect.left + owner.clientLeft;
+        y += rect.top + owner.clientTop;
+        current = current.parent;
+      }
+      return inViewport({ x, y }, current) ? { x, y } : null;
+    };
+    const elementPoint = () => {
+      const rect = element.getBoundingClientRect();
+      return offset
+        ? { x: rect.x + offset.x, y: rect.y + offset.y }
+        : { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    };
+    const unscrolled = inputPoint(elementPoint());
+    if (unscrolled) return unscrolled;
+    element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    const point =
+      inputPoint(elementPoint()) ||
+      (offset ? null : inputPoint(actionPointForElement(element)));
+    return point || { error: "element is not visible in the viewport" };
+  }
 `;
 /**
  * Scroll targeting plus the enabled check, for a forced click that skips the
@@ -12279,7 +12343,9 @@ const CLICK_PROBE_TTL_MS = 5_000;
  * @typedef {string | [number, number] | {x:number,y:number} | {selector:string,x?:number,y?:number}} MouseTarget
  */
 /**
- * Click a mouse target.
+ * Click a mouse target. An element target whose point is outside the viewport
+ * is scrolled into view first, and the click rejects if it still cannot be
+ * reached. Explicit viewport coordinates are dispatched as given.
  * @param {MouseTarget} target CSS selector, @ref, viewport point, or selector-relative point.
  * @param {{button?: "left"|"middle"|"right", clickCount?: number, clicks?: number, label?: string}} [options]
  * @returns {Promise<void>}
@@ -12424,18 +12490,63 @@ async function resolveClickTarget(target) {
         if (point)
             return point;
     }
-    const point = await resolveMouseTarget(target);
+    const point = await resolveElementClickPoint(target);
     return { ...point, probeId: await installClickProbe(point) };
+}
+/**
+ * Resolve a click point on the shared resolver path, bringing an element target
+ * into the viewport when its point falls outside. Explicit coordinates are the
+ * caller's own decision and pass through unchanged.
+ */
+async function resolveElementClickPoint(target) {
+    const point = await resolveMouseTarget(target);
+    const selector = typeof target === "string"
+        ? target
+        : target && typeof target === "object" && "selector" in target
+            ? target.selector
+            : "";
+    if (!selector || (await pointInViewport(point)))
+        return point;
+    const offset = typeof target === "object" &&
+        "selector" in target &&
+        (target.x !== undefined || target.y !== undefined)
+        ? { x: numberValue(target.x), y: numberValue(target.y) }
+        : null;
+    const { result, sessionId } = await resolveAndCall(selector, `function(offset){${CLICK_POINT_HELPERS}
+      return clickPointForElement(this, offset);
+    }`, [offset]);
+    const value = result.result?.value;
+    if (value?.error)
+        throw clickPointError(selector, value.error);
+    if (typeof value?.x !== "number" || typeof value?.y !== "number") {
+        throw clickPointError(selector, "element position is unavailable");
+    }
+    return { x: value.x, y: value.y, sessionId };
+}
+async function pointInViewport(point) {
+    const { x, y } = point;
+    const result = await cdp("Runtime.evaluate", {
+        expression: `${x} >= 0 && ${y} >= 0 && ${x} < innerWidth && ${y} < innerHeight`,
+        returnByValue: true,
+        awaitPromise: false,
+    }, point.sessionId);
+    return result.result?.value !== false;
+}
+function clickPointError(selector, reason) {
+    return new ElementResolutionError(`click failed: ${reason}: ${selector}`, "transient");
 }
 async function resolveRawSelectorClickTarget(selector) {
     if (!isRawSelector(selector))
         return null;
     const id = newProbeId("click");
     const expression = `(() => {
-    const center = ${buildSelectorCenterJs(selector)};
-    if (!center) return null;
-    ${clickProbeInstallJs(id, "center")}
-    return { x: center.x, y: center.y };
+    ${CLICK_POINT_HELPERS}
+    const element = ${buildFindElementJs(selector)};
+    if (!element) return null;
+    const point = clickPointForElement(element, null);
+    if (point.error) return point;
+    ${clickProbeInstallJs(id, "point")}
+    return { x: point.x, y: point.y };
   })()`;
     const result = await cdp("Runtime.evaluate", {
         expression,
@@ -12450,6 +12561,8 @@ async function resolveRawSelectorClickTarget(selector) {
     if (result.exceptionDetails)
         return null;
     const value = result.result?.value;
+    if (value?.error)
+        throw clickPointError(selector, value.error);
     if (typeof value?.x !== "number" || typeof value?.y !== "number") {
         return null;
     }
@@ -21292,6 +21405,7 @@ function assertCdpCall(apiName, method, params, options) {
     if (!params || typeof params !== "object" || Array.isArray(params)) {
         throw new TypeError("cdp params must be an object");
     }
+    assertNoSessionIdInParams(apiName, method, params, `${apiName} selects its own session and cannot route to another one.`);
     validatePublicApiOptions(apiName, options);
 }
 async function waitForTargetToDisappear(services, targetId, timeoutMs) {

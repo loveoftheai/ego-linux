@@ -339,3 +339,33 @@ Port 侧：
 - `vendor/ego-browser/dist` 与 `skill-body/SKILL.md` 从新 worktree 全量同步；
   SDK package version 仍 `0.1.0`，port `package.json` 不变。
 - VERSION：`0.6.0.16-linux.6`。
+
+## 2026-11-05（每日同步）：linux.7——上游 dev 头 / tag v2.2.1-beta.1 3178ca8（CDP sessionId 加固 + v1 点击 iframe 修正）
+
+判定：最新 beta tag 为 `v2.2.1-beta.1`（`3178ca8`，2026-11-04，PR #660
+升版 2.2.1）；`origin/main` HEAD 为 `bacaece`（2026-11-04 合并提交，
+日期虽更新、但其 SDK 仍是 2.2.0 且缺 dev 线修复，同步它等于降级，不
+采用——沿用 2026-11-01 起的 dev 线先例）。目标为 `origin/dev` HEAD 即
+`v2.2.1-beta.1` `3178ca8`。
+
+上游变化（`bbd103c..3178ca8`，SDK 相关 12 文件）：
+- `cdp-eval.ts` / `browser-runtime` 相关：`cdp()` 拒绝 params 内传
+  sessionId（须走第三参数），仅协议本身定义 sessionId 的 Target 命令
+  可豁免（PR #631，citro-2908）；
+- `driver/pointer.ts` / `action-target.ts` / `element-resolver.ts`：
+  v1 点击坐标从同进程 iframe 内换算出来、禁止点击视口外目标
+  （PR #635，citro-3536）；
+- `skill-body/SKILL.md`：用法指南精简（shell heredoc / `-e` / `.mjs`
+  入口说明收紧）、版本升至 2.2.1；`tools/linear-autofix` 仅忽略无关
+  工单（不属于 port，不同步）。
+绑定层无需改动（无新 API；点击与 sessionId 改动均在 SDK 内）。
+
+Port 侧：
+- 两处 Linux 补丁在新源码上逐字重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支，上游仍从 ppid 派生，未变；
+  `browser-runtime.ts` 的 `enableEgoAutomation()` masking 回退），打完后
+  源码与 linux.6 的带补丁源码之差恰好等于上游改动；bundle 核对含两处
+  分支与新 iframe 点击文案。
+- `vendor/ego-browser/dist` 与 `skill-body/SKILL.md` 从新 worktree 全量
+  同步；SDK package version 仍 `0.1.0`，port `package.json` 不变。
+- VERSION：`0.6.0.16-linux.7`。
