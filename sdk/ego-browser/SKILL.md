@@ -329,11 +329,11 @@ When the task succeeds, close the TaskSpace by default with `await task.finish({
 
 `finish()` ends the task and all of its Page labels, including Pages kept for the user. Put it last in the final round only; do not operate any Page after it in the same script or in later rounds.
 
-Keeping Pages is a rare exception: retain only necessary Pages when the user explicitly asks, or when the result must remain in the browser for the user to view or continue working with. Pages merely visited, search results, and intermediate steps do not need to remain open.
+Keep a Page only when the user explicitly asked to leave it open, or when the user must act in it next (for example, review and submit a form you filled). Showing an answer, a result, or a page the user might like to see is not a reason to keep it: report the result in your reply instead. Any kept Page leaves the space open instead of closing it.
 
 ```js
-await task.finish({ keep: [] }); // Default: keep no Agent-managed Pages.
-await task.finish({ keep: ["p2"] }); // Exception: keep only the result Page for the user.
+await task.finish({ keep: [] }); // Default: close the space.
+await task.finish({ keep: ["p2"] }); // Only if the user asked to keep p2 open.
 ```
 
 User-created and unknown-origin tabs are protected; if any remain, `keep: []` does not close the whole space. The blank tab that `page.close()` leaves when it closes the last Page is SDK-owned and never blocks closing. Do not close unwanted Pages one by one at completion; list the Pages to keep instead. Use `page.close()` only while the task is still in progress. Do not call `finish()` when the task stops for user control or an error.
