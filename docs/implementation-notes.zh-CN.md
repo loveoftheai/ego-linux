@@ -393,3 +393,27 @@ Port 侧：
 - `vendor/ego-browser/dist` 与 `skill-body/SKILL.md` 从新 worktree 全量
   同步；SDK package version 仍 `0.1.0`，port `package.json` 不变。
 - VERSION：`0.6.0.16-linux.8`。
+
+## 2026-11-10（每日同步）：linux.9——上游 dev 头 0882f94（PR #694 回退 PR #674，纯文档变更）
+
+判定：最新 beta tag 仍为 `v2.2.1-beta.2`（`bd11e52`，2026-11-06）；
+`origin/dev` HEAD 前进到 `0882f94`（2026-11-09，Merge PR #694
+"revert-pr-674"）；`origin/main` HEAD 仍为 `bacaece`（2026-11-04，其
+SDK 仍是 2.2.0 且缺 dev 线修复，同步它等于降级，不采用——沿用 dev 线
+先例）。目标为 `origin/dev` HEAD `0882f94`。
+
+上游变化（`bd11e52..0882f94`，仅 1 文件、6 行增/7 行删）：回退 PR #674，
+`skill-body/SKILL.md` 的 finish 时保留 Page 指引恢复为 linux.7 的写法。
+无 `.ts` 行为改动、无新公共 API。绑定层无需改动（`src/*.js` 未动）。
+
+Port 侧：
+- 两处 Linux 补丁从 linux.8 工作树逐字复制重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支，上游仍从 ppid 派生，未变；
+  `browser-runtime.ts` 的 `enableEgoAutomation()` masking 回退），打完后
+  源码与上游之差恰好等于这两处补丁（24 行增、1 行删）；bundle
+  （`dist/out/index.js`）与 linux.8 字节一致且含两处补丁；
+  `skill-body/SKILL.md` 与 linux.7 源码逐字节一致（回退确认）。
+- `vendor/ego-browser/dist` 与 `skill-body/SKILL.md` 从新 worktree 全量
+  同步（与新构建逐字节一致；与 linux.8 相比仅 4 份 SKILL.md 变化）；
+  SDK package version 仍 `0.1.0`，port `package.json` 不变。
+- VERSION：`0.6.0.16-linux.9`。
