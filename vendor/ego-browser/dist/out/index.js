@@ -11765,6 +11765,162 @@ function send(cdp, method, params = {}, sessionId = undefined) {
     return cdp.sendRaw(method, params, sessionId);
 }
 
+const browserRefMap = new RefMap();
+let ensuring = false;
+let snapshotImpl = null;
+function registerSnapshotForRefRefresh(fn) {
+    snapshotImpl = fn;
+}
+async function ensureRefMapForRef(selectorOrRef) {
+    if (ensuring)
+        return;
+    if (typeof selectorOrRef !== "string")
+        return;
+    if (!parseRef(selectorOrRef))
+        return;
+    if (browserRefMap.map.size > 0)
+        return;
+    if (!snapshotImpl)
+        return;
+    ensuring = true;
+    try {
+        await snapshotImpl();
+    }
+    finally {
+        ensuring = false;
+    }
+}
+
+/**
+ * Run a v1 resolution in the top document first, then once more across the
+ * Page's same-process iframes when nothing matched there.
+ *
+ * The v1 helpers resolve in the current Page session, where a role locator
+ * reads only the top document's accessibility tree and a CSS locator queries
+ * only the top document. Searching frames only after a miss keeps every
+ * top-document result and ambiguity unchanged. A same-process frame shares
+ * the Page session, so each frame maps to the default session (`undefined`)
+ * and the resolver addresses it by frame id.
+ */
+async function resolveInPageFrames(selectorOrRef, resolve) {
+    try {
+        return await resolve(new Map());
+    }
+    catch (error) {
+        if (typeof selectorOrRef !== "string" ||
+            parseRef(selectorOrRef) ||
+            !/ matched 0 elements/.test(error?.message || "")) {
+            throw error;
+        }
+        const iframeSessions = await sameProcessFrames();
+        if (iframeSessions.size === 0)
+            throw error;
+        return resolve(iframeSessions);
+    }
+}
+/**
+ * Frames rendered by the Page's own process. An out-of-process iframe is
+ * listed in the frame tree too, but only its own session can address it, so
+ * it and every frame below it are left out. Without the target list there is
+ * no way to tell them apart, and the caller keeps the top-document miss.
+ */
+async function sameProcessFrames() {
+    const frames = new Map();
+    let tree;
+    let targetInfos;
+    try {
+        [tree, targetInfos] = await Promise.all([
+            cdp("Page.getFrameTree").then((result) => result?.frameTree),
+            cdp("Target.getTargets").then((result) => result?.targetInfos),
+        ]);
+    }
+    catch {
+        return frames;
+    }
+    if (!Array.isArray(targetInfos))
+        return frames;
+    // An out-of-process iframe target's id is its frame id.
+    const outOfProcess = new Set(targetInfos
+        .filter((info) => info?.type === "iframe")
+        .map((info) => info.targetId));
+    const visit = (node) => {
+        for (const child of node?.childFrames || []) {
+            const frameId = child?.frame?.id;
+            if (typeof frameId !== "string" || outOfProcess.has(frameId))
+                continue;
+            frames.set(frameId, undefined);
+            visit(child);
+        }
+    };
+    visit(tree);
+    return frames;
+}
+/**
+ * Resolve any selector form to a CDP Runtime objectId handle.
+ * Accepts @ref / ref=N, loc=css:/loc=role:/loc=href:, text=, xpath=, and raw
+ * CSS — the same surface as the pointer/observe helpers, via the unified resolver.
+ * Refreshes the RefMap on demand when the input is a ref and the map is empty.
+ * @param {string} selectorOrRef Selector or ref string.
+ * @returns {Promise<{objectId: string, sessionId?: string}>}
+ */
+async function resolveHandle(selectorOrRef) {
+    await ensureRefMapForRef(selectorOrRef);
+    return resolveInPageFrames(selectorOrRef, (iframeSessions) => resolveElementObjectId({ sendRaw: cdp }, undefined, browserRefMap, selectorOrRef, iframeSessions));
+}
+/**
+ * Release a Runtime objectId handle. Best-effort: swallows "already gone"
+ * errors (stale handle, lost session, destroyed context).
+ * @param {string} objectId Runtime remote object id to release.
+ * @param {string} [sessionId] Session that owns the handle.
+ * @returns {Promise<void>}
+ */
+async function releaseHandle(objectId, sessionId) {
+    if (!objectId)
+        return;
+    try {
+        await cdp("Runtime.releaseObject", { objectId }, sessionId);
+    }
+    catch {
+        // Handle/session already invalid; releasing is best-effort.
+    }
+}
+/**
+ * Resolve a handle, run fn(handle), then release the handle — even if fn throws.
+ * @param {string} selectorOrRef Selector or ref string.
+ * @param {(handle: {objectId: string, sessionId?: string}) => Promise<any>} fn Callback bound to the resolved handle.
+ * @returns {Promise<any>} Whatever fn returns.
+ */
+async function withHandle(selectorOrRef, fn) {
+    const handle = await resolveHandle(selectorOrRef);
+    try {
+        return await fn(handle);
+    }
+    finally {
+        await releaseHandle(handle.objectId, handle.sessionId);
+    }
+}
+/**
+ * Resolve an element and call a function on it via Runtime.callFunctionOn,
+ * with the element bound as `this`. The resolved handle is released afterward;
+ * the returned objectId is already freed and must not be reused.
+ * @param {string} selectorOrRef Selector or ref string.
+ * @param {string} functionDeclaration Function source whose `this` is the element.
+ * @param {Array<unknown>} [args=[]] Arguments passed by value.
+ * @returns {Promise<{result: any, objectId: string, sessionId?: string}>}
+ */
+async function resolveAndCall(selectorOrRef, functionDeclaration, args = []) {
+    return withHandle(selectorOrRef, async ({ objectId, sessionId }) => {
+        const result = await cdp("Runtime.callFunctionOn", {
+            functionDeclaration,
+            objectId,
+            arguments: args.map((value) => ({ value })),
+            returnByValue: true,
+            awaitPromise: false,
+        }, sessionId);
+        return { result, objectId, sessionId };
+    });
+}
+
 /**
  * Remove redundant native snapshot wrappers without changing semantic nodes.
  *
@@ -12095,32 +12251,6 @@ function snapshotLocatorCandidates(refs) {
     });
 }
 
-const browserRefMap = new RefMap();
-let ensuring = false;
-let snapshotImpl = null;
-function registerSnapshotForRefRefresh(fn) {
-    snapshotImpl = fn;
-}
-async function ensureRefMapForRef(selectorOrRef) {
-    if (ensuring)
-        return;
-    if (typeof selectorOrRef !== "string")
-        return;
-    if (!parseRef(selectorOrRef))
-        return;
-    if (browserRefMap.map.size > 0)
-        return;
-    if (!snapshotImpl)
-        return;
-    ensuring = true;
-    try {
-        await snapshotImpl();
-    }
-    finally {
-        ensuring = false;
-    }
-}
-
 async function drainEvents() {
     const sessionId = isBrowserRuntime() ? await ensureSession() : undefined;
     return drainBrowserEvents(sessionId);
@@ -12149,7 +12279,7 @@ async function snapshotText(options = {}) {
 }
 async function elementCenter(selectorOrRef) {
     await ensureRefMapForRef(selectorOrRef);
-    return resolveElementCenter({ sendRaw: cdp }, undefined, browserRefMap, selectorOrRef);
+    return resolveInPageFrames(selectorOrRef, (iframeSessions) => resolveElementCenter({ sendRaw: cdp }, undefined, browserRefMap, selectorOrRef, iframeSessions));
 }
 /**
  * Directory and name for a screenshot taken without an explicit path.
@@ -12255,72 +12385,6 @@ var observe = /*#__PURE__*/Object.freeze({
     snapshotRaw: snapshotRaw,
     snapshotText: snapshotText
 });
-
-/**
- * Resolve any selector form to a CDP Runtime objectId handle.
- * Accepts @ref / ref=N, loc=css:/loc=role:/loc=href:, text=, xpath=, and raw
- * CSS — the same surface as the pointer/observe helpers, via the unified resolver.
- * Refreshes the RefMap on demand when the input is a ref and the map is empty.
- * @param {string} selectorOrRef Selector or ref string.
- * @returns {Promise<{objectId: string, sessionId?: string}>}
- */
-async function resolveHandle(selectorOrRef) {
-    await ensureRefMapForRef(selectorOrRef);
-    return resolveElementObjectId({ sendRaw: cdp }, undefined, browserRefMap, selectorOrRef);
-}
-/**
- * Release a Runtime objectId handle. Best-effort: swallows "already gone"
- * errors (stale handle, lost session, destroyed context).
- * @param {string} objectId Runtime remote object id to release.
- * @param {string} [sessionId] Session that owns the handle.
- * @returns {Promise<void>}
- */
-async function releaseHandle(objectId, sessionId) {
-    if (!objectId)
-        return;
-    try {
-        await cdp("Runtime.releaseObject", { objectId }, sessionId);
-    }
-    catch {
-        // Handle/session already invalid; releasing is best-effort.
-    }
-}
-/**
- * Resolve a handle, run fn(handle), then release the handle — even if fn throws.
- * @param {string} selectorOrRef Selector or ref string.
- * @param {(handle: {objectId: string, sessionId?: string}) => Promise<any>} fn Callback bound to the resolved handle.
- * @returns {Promise<any>} Whatever fn returns.
- */
-async function withHandle(selectorOrRef, fn) {
-    const handle = await resolveHandle(selectorOrRef);
-    try {
-        return await fn(handle);
-    }
-    finally {
-        await releaseHandle(handle.objectId, handle.sessionId);
-    }
-}
-/**
- * Resolve an element and call a function on it via Runtime.callFunctionOn,
- * with the element bound as `this`. The resolved handle is released afterward;
- * the returned objectId is already freed and must not be reused.
- * @param {string} selectorOrRef Selector or ref string.
- * @param {string} functionDeclaration Function source whose `this` is the element.
- * @param {Array<unknown>} [args=[]] Arguments passed by value.
- * @returns {Promise<{result: any, objectId: string, sessionId?: string}>}
- */
-async function resolveAndCall(selectorOrRef, functionDeclaration, args = []) {
-    return withHandle(selectorOrRef, async ({ objectId, sessionId }) => {
-        const result = await cdp("Runtime.callFunctionOn", {
-            functionDeclaration,
-            objectId,
-            arguments: args.map((value) => ({ value })),
-            returnByValue: true,
-            awaitPromise: false,
-        }, sessionId);
-        return { result, objectId, sessionId };
-    });
-}
 
 // Native mouse events are delivered in order by the renderer, so a click needs
 // no pause between move, press, and release. Explicit `delayMs` options and
@@ -18086,6 +18150,22 @@ class PageLedgerStore {
         const browserInstanceId = await this.#currentBrowserInstanceId();
         await this.#removeAll(await this.#listVersions(spaceId, browserInstanceId));
     }
+    /**
+     * End a task whose space stays open for the user. Labels end with the task,
+     * but the origin of the tabs the agent left open survives so a later claim
+     * does not mistake them for user tabs. The ledger stays uninitialized: every
+     * other tab found at the claim is still treated as unknown.
+     */
+    async retainForUser(spaceId, targetIds) {
+        assertSpaceId(spaceId);
+        targetIds.forEach(assertTargetId);
+        const ledger = emptyLedger(spaceId, await this.#currentBrowserInstanceId());
+        for (const targetId of targetIds) {
+            ledger.unmanagedTargets[targetId] = "agent";
+        }
+        ledger.retainedTargets = [...targetIds];
+        await this.#writeLatest(spaceId, ledger);
+    }
     async getPage(spaceId, label) {
         assertLabel(label);
         const ledger = await this.read(spaceId);
@@ -18234,6 +18314,7 @@ class PageLedgerStore {
                 if (!live.has(targetId))
                     delete ledger.unmanagedTargets[targetId];
             }
+            ledger.retainedTargets = ledger.retainedTargets.filter((targetId) => live.has(targetId));
             const managedTargets = new Set(Object.values(ledger.pages).map((page) => page.targetId));
             const untracked = [...live].filter((targetId) => !managedTargets.has(targetId) &&
                 !Object.hasOwn(ledger.unmanagedTargets, targetId));
@@ -18524,6 +18605,7 @@ function emptyLedger(spaceId, browserInstanceId) {
         initialized: false,
         userControlPending: false,
         unmanagedTargets: {},
+        retainedTargets: [],
         pages: {},
     };
 }
@@ -18561,6 +18643,7 @@ function validateLedger(value, expectedSpaceId, path) {
     const userControlPending = stored.userControlPending ??
         (legacyHandoffBaseline !== undefined && legacyHandoffBaseline !== null);
     const unmanagedTargets = stored.unmanagedTargets ?? {};
+    const retainedTargets = stored.retainedTargets ?? [];
     if ((stored.browserInstanceId !== undefined &&
         (typeof stored.browserInstanceId !== "string" ||
             stored.browserInstanceId.length === 0)) ||
@@ -18584,6 +18667,8 @@ function validateLedger(value, expectedSpaceId, path) {
         Array.isArray(unmanagedTargets) ||
         Object.entries(unmanagedTargets).some(([targetId, openedBy]) => targetId.length === 0 ||
             !["agent", "user", "unknown"].includes(openedBy)) ||
+        !Array.isArray(retainedTargets) ||
+        retainedTargets.some((targetId) => typeof targetId !== "string" || targetId.length === 0) ||
         !stored.pages ||
         typeof stored.pages !== "object" ||
         Array.isArray(stored.pages)) {
@@ -18623,6 +18708,7 @@ function validateLedger(value, expectedSpaceId, path) {
         initialized,
         userControlPending,
         unmanagedTargets: normalizedUnmanagedTargets,
+        retainedTargets: [...retainedTargets],
         pages,
     };
 }
@@ -19309,15 +19395,14 @@ class TaskSpace {
             const agentUnmanagedSet = new Set(agentUnmanagedTargets);
             const preservedUnmanagedCount = tabs.filter((tab) => !managedByTarget.has(tab.targetId) &&
                 !agentUnmanagedSet.has(tab.targetId)).length;
-            const hasProtectedTabs = tabs.some((tab) => {
+            const protectedTabCount = tabs.filter((tab) => {
                 const managed = managedByTarget.get(tab.targetId);
                 if (managed)
                     return managed.openedBy === "unknown";
                 return !agentUnmanagedSet.has(tab.targetId);
-            });
-            if (options.keep !== "all" &&
-                options.keep.length === 0 &&
-                !hasProtectedTabs) {
+            }).length;
+            const keepsNothing = options.keep !== "all" && options.keep.length === 0;
+            if (keepsNothing && protectedTabCount === 0) {
                 await this.#services.closeTaskSpace();
                 await this.#discardTerminalState();
                 return {
@@ -19331,9 +19416,24 @@ class TaskSpace {
             for (const label of labelsToClose) {
                 await this.page(label).close();
             }
-            await this.#closeAgentUnmanagedTabs(agentUnmanagedTargets);
+            // Tabs an earlier finish() left for the user go only when this finish
+            // keeps nothing; a keep list can only name labels, so it cannot cover them.
+            const retainedEarlier = new Set(keepsNothing ? [] : ledger.retainedTargets);
+            const anchorsLeftOpen = await this.#closeAgentUnmanagedTabs(agentUnmanagedTargets.filter((id) => !retainedEarlier.has(id)));
             await this.#services.completeTaskSpace();
-            await this.#discardTerminalState();
+            await this.#discardTerminalState([
+                ...keptManagedLabels
+                    .map((label) => ledger.pages[label])
+                    .filter((page) => page.openedBy === "agent")
+                    .map((page) => page.targetId),
+                ...agentUnmanagedTargets.filter((id) => retainedEarlier.has(id)),
+                ...anchorsLeftOpen,
+            ]);
+            if (keepsNothing) {
+                bufferOutput(`[ego-browser] finish({ keep: [] }) did not close task space ${this.spaceId}: ` +
+                    `${protectedTabCount} tab(s) of user or unknown origin stayed open, ` +
+                    "and the space now belongs to the user.\n");
+            }
             return {
                 spaceId: this.spaceId,
                 closedSpace: false,
@@ -19346,15 +19446,20 @@ class TaskSpace {
     /**
      * Close SDK-opened unmanaged tabs (blank anchors) that the space no longer
      * needs. A tab that is the last one in the space stays: closing it would
-     * destroy the space the caller chose to keep.
+     * destroy the space the caller chose to keep. Returns the tabs left open.
      */
     async #closeAgentUnmanagedTabs(targetIds) {
         if (targetIds.length === 0)
-            return;
+            return [];
+        const leftOpen = [];
         let live = new Set((await this.#services.listTabs()).map((tab) => tab.targetId));
         for (const targetId of targetIds) {
-            if (!live.has(targetId) || live.size <= 1)
+            if (!live.has(targetId))
                 continue;
+            if (live.size <= 1) {
+                leftOpen.push(targetId);
+                continue;
+            }
             const result = await this.#services.cdp("Target.closeTarget", {
                 targetId,
             });
@@ -19369,6 +19474,7 @@ class TaskSpace {
             this.#services.pageRefs.clear(targetId);
             live = new Set((await this.#services.listTabs()).map((tab) => tab.targetId));
         }
+        return leftOpen;
     }
     async [rollbackCreatedTaskSpaceToken]() {
         await this.#services.gate.withSpace(this.spaceId, async () => {
@@ -19376,9 +19482,14 @@ class TaskSpace {
             await this.#discardTerminalState();
         });
     }
-    async #discardTerminalState() {
+    async #discardTerminalState(retainedTargets = []) {
         this.#finished = true;
-        await this.#services.ledger.discard(this.spaceId);
+        if (retainedTargets.length > 0) {
+            await this.#services.ledger.retainForUser(this.spaceId, retainedTargets);
+        }
+        else {
+            await this.#services.ledger.discard(this.spaceId);
+        }
         this.#stopBackgroundPageDiscovery();
         clearSpacePageNotices(this.spaceId);
     }

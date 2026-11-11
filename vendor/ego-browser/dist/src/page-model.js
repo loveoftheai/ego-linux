@@ -88,6 +88,7 @@ import {
   recordUnhandledPage,
   subscribeUnhandledPageNotices
 } from "./page-discovery.js";
+import { bufferOutput } from "./output-sink.js";
 import {
   publicApiEntry,
   validatePublicApiOptions
@@ -760,12 +761,13 @@ class TaskSpace {
       const preservedUnmanagedCount = tabs.filter(
         (tab) => !managedByTarget.has(tab.targetId) && !agentUnmanagedSet.has(tab.targetId)
       ).length;
-      const hasProtectedTabs = tabs.some((tab) => {
+      const protectedTabCount = tabs.filter((tab) => {
         const managed = managedByTarget.get(tab.targetId);
         if (managed) return managed.openedBy === "unknown";
         return !agentUnmanagedSet.has(tab.targetId);
-      });
-      if (options.keep !== "all" && options.keep.length === 0 && !hasProtectedTabs) {
+      }).length;
+      const keepsNothing = options.keep !== "all" && options.keep.length === 0;
+      if (keepsNothing && protectedTabCount === 0) {
         await this.#services.closeTaskSpace();
         await this.#discardTerminalState();
         return {
@@ -779,9 +781,24 @@ class TaskSpace {
       for (const label of labelsToClose) {
         await this.page(label).close();
       }
-      await this.#closeAgentUnmanagedTabs(agentUnmanagedTargets);
+      const retainedEarlier = new Set(
+        keepsNothing ? [] : ledger.retainedTargets
+      );
+      const anchorsLeftOpen = await this.#closeAgentUnmanagedTabs(
+        agentUnmanagedTargets.filter((id) => !retainedEarlier.has(id))
+      );
       await this.#services.completeTaskSpace();
-      await this.#discardTerminalState();
+      await this.#discardTerminalState([
+        ...keptManagedLabels.map((label) => ledger.pages[label]).filter((page) => page.openedBy === "agent").map((page) => page.targetId),
+        ...agentUnmanagedTargets.filter((id) => retainedEarlier.has(id)),
+        ...anchorsLeftOpen
+      ]);
+      if (keepsNothing) {
+        bufferOutput(
+          `[ego-browser] finish({ keep: [] }) did not close task space ${this.spaceId}: ${protectedTabCount} tab(s) of user or unknown origin stayed open, and the space now belongs to the user.
+`
+        );
+      }
       return {
         spaceId: this.spaceId,
         closedSpace: false,
@@ -794,15 +811,20 @@ class TaskSpace {
   /**
    * Close SDK-opened unmanaged tabs (blank anchors) that the space no longer
    * needs. A tab that is the last one in the space stays: closing it would
-   * destroy the space the caller chose to keep.
+   * destroy the space the caller chose to keep. Returns the tabs left open.
    */
   async #closeAgentUnmanagedTabs(targetIds) {
-    if (targetIds.length === 0) return;
+    if (targetIds.length === 0) return [];
+    const leftOpen = [];
     let live = new Set(
       (await this.#services.listTabs()).map((tab) => tab.targetId)
     );
     for (const targetId of targetIds) {
-      if (!live.has(targetId) || live.size <= 1) continue;
+      if (!live.has(targetId)) continue;
+      if (live.size <= 1) {
+        leftOpen.push(targetId);
+        continue;
+      }
       const result = await this.#services.cdp("Target.closeTarget", {
         targetId
       });
@@ -825,6 +847,7 @@ class TaskSpace {
         (await this.#services.listTabs()).map((tab) => tab.targetId)
       );
     }
+    return leftOpen;
   }
   async [rollbackCreatedTaskSpaceToken]() {
     await this.#services.gate.withSpace(this.spaceId, async () => {
@@ -832,9 +855,13 @@ class TaskSpace {
       await this.#discardTerminalState();
     });
   }
-  async #discardTerminalState() {
+  async #discardTerminalState(retainedTargets = []) {
     this.#finished = true;
-    await this.#services.ledger.discard(this.spaceId);
+    if (retainedTargets.length > 0) {
+      await this.#services.ledger.retainForUser(this.spaceId, retainedTargets);
+    } else {
+      await this.#services.ledger.discard(this.spaceId);
+    }
     this.#stopBackgroundPageDiscovery();
     clearSpacePageNotices(this.spaceId);
   }

@@ -87,6 +87,22 @@ class PageLedgerStore {
     const browserInstanceId = await this.#currentBrowserInstanceId();
     await this.#removeAll(await this.#listVersions(spaceId, browserInstanceId));
   }
+  /**
+   * End a task whose space stays open for the user. Labels end with the task,
+   * but the origin of the tabs the agent left open survives so a later claim
+   * does not mistake them for user tabs. The ledger stays uninitialized: every
+   * other tab found at the claim is still treated as unknown.
+   */
+  async retainForUser(spaceId, targetIds) {
+    assertSpaceId(spaceId);
+    targetIds.forEach(assertTargetId);
+    const ledger = emptyLedger(spaceId, await this.#currentBrowserInstanceId());
+    for (const targetId of targetIds) {
+      ledger.unmanagedTargets[targetId] = "agent";
+    }
+    ledger.retainedTargets = [...targetIds];
+    await this.#writeLatest(spaceId, ledger);
+  }
   async getPage(spaceId, label) {
     assertLabel(label);
     const ledger = await this.read(spaceId);
@@ -233,6 +249,9 @@ class PageLedgerStore {
       for (const targetId of Object.keys(ledger.unmanagedTargets)) {
         if (!live.has(targetId)) delete ledger.unmanagedTargets[targetId];
       }
+      ledger.retainedTargets = ledger.retainedTargets.filter(
+        (targetId) => live.has(targetId)
+      );
       const managedTargets = new Set(
         Object.values(ledger.pages).map((page) => page.targetId)
       );
@@ -501,6 +520,7 @@ function emptyLedger(spaceId, browserInstanceId) {
     initialized: false,
     userControlPending: false,
     unmanagedTargets: {},
+    retainedTargets: [],
     pages: {}
   };
 }
@@ -531,12 +551,15 @@ function validateLedger(value, expectedSpaceId, path) {
   const legacyHandoffBaseline = stored.handoffBaseline;
   const userControlPending = stored.userControlPending ?? (legacyHandoffBaseline !== void 0 && legacyHandoffBaseline !== null);
   const unmanagedTargets = stored.unmanagedTargets ?? {};
+  const retainedTargets = stored.retainedTargets ?? [];
   if (stored.browserInstanceId !== void 0 && (typeof stored.browserInstanceId !== "string" || stored.browserInstanceId.length === 0) || stored.spaceId !== expectedSpaceId || !Number.isInteger(stored.nextLabel) || stored.nextLabel < 1 || !Array.isArray(stored.usedLabels) || stored.usedLabels.some((label) => typeof label !== "string") || !Array.isArray(releasedLabels) || releasedLabels.some(
     (label) => typeof label !== "string" || !stored.usedLabels.includes(label) || Object.hasOwn(stored.pages || {}, label)
   ) || typeof initialized !== "boolean" || typeof userControlPending !== "boolean" || legacyHandoffBaseline !== void 0 && legacyHandoffBaseline !== null && (!Array.isArray(legacyHandoffBaseline) || legacyHandoffBaseline.some(
     (targetId) => typeof targetId !== "string" || targetId.length === 0
   )) || !unmanagedTargets || typeof unmanagedTargets !== "object" || Array.isArray(unmanagedTargets) || Object.entries(unmanagedTargets).some(
     ([targetId, openedBy]) => targetId.length === 0 || !["agent", "user", "unknown"].includes(openedBy)
+  ) || !Array.isArray(retainedTargets) || retainedTargets.some(
+    (targetId) => typeof targetId !== "string" || targetId.length === 0
   ) || !stored.pages || typeof stored.pages !== "object" || Array.isArray(stored.pages)) {
     throw new Error(`invalid page ledger ${path}: schema mismatch`);
   }
@@ -571,6 +594,7 @@ function validateLedger(value, expectedSpaceId, path) {
     initialized,
     userControlPending,
     unmanagedTargets: normalizedUnmanagedTargets,
+    retainedTargets: [...retainedTargets],
     pages
   };
 }

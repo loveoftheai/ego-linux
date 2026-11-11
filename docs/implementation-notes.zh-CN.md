@@ -417,3 +417,40 @@ Port 侧：
   同步（与新构建逐字节一致；与 linux.8 相比仅 4 份 SKILL.md 变化）；
   SDK package version 仍 `0.1.0`，port `package.json` 不变。
 - VERSION：`0.6.0.16-linux.9`。
+
+## 2026-11-11（每日同步）：linux.10——上游 dev 头 / tag v2.2.1-beta.3 fa2de6b（v1 元素定位进同进程 iframe + claimed space 的 finish 语义）
+
+判定：最新 beta tag `v2.2.1-beta.3`（`fa2de6b`，2026-11-10，Merge PR
+#703）；`origin/dev` HEAD 同为 `fa2de6b`；`origin/main` HEAD 仍为
+`bacaece`（2026-11-04，其 SDK 仍是 2.2.0 且缺 dev 线修复，同步它等于
+降级，不采用——沿用 dev 线先例）。目标为 `origin/dev` HEAD 即
+`v2.2.1-beta.3` `fa2de6b`。
+
+上游变化（`0882f94..fa2de6b`，15 文件、657 行增/93 行删）：
+- PR #708：v1 元素定位（`elementCenter`/`resolveHandle`）在顶层文档
+  未命中时，重试同进程 iframe（`resolveInPageFrames`，仅
+  `matched 0 elements` 且非 ref 选择器时重试；OOPIF 明确排除在重试
+  之外）；wheel 滚动类 E2E 动作超时放宽到 10s（仅测试）。
+- PR #703：`finish()` 在 claimed space 上语义收紧——keep 为空且只有
+  保留的 agent tab 时关 space；账本新增 `retainedTargets`，上一次
+  finish 留给用户的 tab 在下一次 claim 时不再被误认作用户 tab；另有
+  finish/claim 指引文档重写（每目标一 space 跨回复复用、
+  "Starting and ending a reply"、finish 独占回复的最后一段脚本——后者
+  随后又被同 PR 内一次 revert 撤回，净效果以最终版为准）。
+- SKILL.md 大幅改写（124 行）：task-space 生命周期指引重写。
+- 其余为测试（`page-model.test.mjs` +263 行、`observe.test.mjs`
+  +109 行、`page-ledger.test.mjs` +22 行）与 e2e case 超时调整。
+  无新公共 API。绑定层无需改动（`src/*.js` 未动；新行为全在 SDK
+  bundle 内）。
+
+Port 侧：
+- 两处 Linux 补丁从 linux.9 工作树逐字复制重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支，上游仍从 ppid 派生，未变；
+  `browser-runtime.ts` 的 `enableEgoAutomation()` masking 回退），
+  `git apply --check` 一次通过，打完后源码与上游之差恰好等于这两处
+  补丁（24 行增、1 行删）；上游单测 `npm test` 662/662 通过（含新增
+  的 page-model/observe/ledger 测试）。
+- `vendor/ego-browser/dist` 与 `skill-body/SKILL.md` 从新 worktree 全量
+  同步（与新构建逐字节一致）；SDK package version 仍 `0.1.0`，port
+  `package.json` 不变。
+- VERSION：`0.6.0.16-linux.10`。
