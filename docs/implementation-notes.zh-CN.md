@@ -454,3 +454,33 @@ Port 侧：
   同步（与新构建逐字节一致）；SDK package version 仍 `0.1.0`，port
   `package.json` 不变。
 - VERSION：`0.6.0.16-linux.10`。
+
+## 2026-11-17（每日同步）：linux.11——上游正式版 tag v2.2.1 f499162（star-history 工作流 + README 更新，无 SDK 变化）
+
+判定：最新 v* tag `v2.2.1`（`f499162`，2026-11-16，Merge PR #739
+hotfix/release-v2.2.1-beta.3）；`origin/main` HEAD 同为 `f499162`，自
+2026-11-04 的 `bacaece`（SDK 2.2.0）首次前进，与正式版 tag 重合。目标为
+二者中较新者——同为 `v2.2.1` `f499162`。`origin/dev` HEAD 为 `37b1afb`
+（2026-11-16 17:01，Merge PR #720），比目标更新，但按同步规则目标取
+最新 beta/正式 tag 与 `origin/main` 中较新者，dev 线不在本次目标内，
+下轮复核时再判定。
+
+上游变化（`fa2de6b..f499162`，19 文件、503 行增/190 行删）：全部在
+`package/` 之外——`.github/star-history/` 新增（star-history 工作流、
+SVG 后处理脚本、Patrick Hand 字体）、`.github/workflows/` 调整、9 份
+README 的徽章/数据更新、`docs/assets/real-world-bench.jpg` 新增。
+`package/ego-browser/` 零改动：SDK 源码、SKILL.md、package.json
+（仍 `0.1.0`）与 `page-ledger.ts` 的 ppid 派生均未变，无新公共 API。
+绑定层无需改动（`src/*.js` 未动）。
+
+Port 侧：
+- 两处 Linux 补丁从 linux.10 工作树逐字复制重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支，上游仍从 ppid 派生，未变；
+  `browser-runtime.ts` 的 `enableEgoAutomation()` masking 回退），打完
+  后两文件与 linux.10 工作树逐字节一致；上游单测 `npm test` 662/662
+  通过。
+- `vendor/ego-browser/dist`、`skill-body/SKILL.md`、`package.json`、
+  `README.md`（vendor 内）与新 worktree 构建逐字节一致——本次同步
+  SDK bundle 与 linux.10 完全相同，port 侧实质变化只有 VERSION、
+  README 版本映射行与本文档条目；port `package.json` 不变。
+- VERSION：`0.6.0.16-linux.11`。
