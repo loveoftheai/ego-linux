@@ -8991,7 +8991,41 @@ function clearIgnoredFaviconRequest(targetId, requestId) {
     }
     return deleted;
 }
+/**
+ * Drop in-flight entries left by the document a frame just replaced.
+ *
+ * Chromium can omit both terminal events for requests whose document is
+ * navigated away while they are still loading, so those entries would
+ * otherwise block network idle forever. Only the committed frame is pruned:
+ * requests of other frames and OOPIF targets, requests without a loader, and
+ * the new document's own requests (which carry the new loaderId) stay tracked.
+ */
+function pruneReplacedDocumentRequests(targetId, frame) {
+    const frameId = frame?.id;
+    const loaderId = frame?.loaderId;
+    if (typeof frameId !== "string" || typeof loaderId !== "string")
+        return;
+    const now = state.now();
+    for (const pageTargetId of pageTreeTargetIds(pageRootTargetId(targetId))) {
+        const pageTarget = targetStates.get(pageTargetId);
+        if (!pageTarget)
+            continue;
+        for (const [requestId, request] of pageTarget.inflightNetworkRequests) {
+            if (request.frameId !== frameId ||
+                request.loaderId === undefined ||
+                request.loaderId === loaderId) {
+                continue;
+            }
+            pageTarget.inflightNetworkRequests.delete(requestId);
+            pageTarget.lastNetworkActivityAt = now;
+        }
+    }
+}
 function recordNetworkEvent(targetId, target, data) {
+    if (data.method === "Page.frameNavigated") {
+        pruneReplacedDocumentRequests(targetId, data.params?.frame);
+        return;
+    }
     // A response to Network.disable can be followed by a queued terminal event.
     // Ignore it once tracking is off, while still accepting events that race the
     // response to our own Network.enable request.
@@ -9271,7 +9305,7 @@ let hasWarnedAboutFunctionJs = false;
 /**
  * Send a raw Chrome DevTools Protocol command.
  * @param {string} method CDP method name, for example Runtime.evaluate.
- * @param {object} [params] CDP command parameters. A sessionId here is rejected, except on Target commands that define it.
+ * @param {object} [params] CDP command parameters. A sessionId here is rejected, except on the commands that define it: Target.detachFromTarget, Target.sendMessageToTarget and Page.screencastFrameAck.
  * @param {string} [sessionId] Optional attached target session id. Defaults to the current page session.
  * @returns {Promise<object>} CDP result object.
  */
@@ -9289,8 +9323,11 @@ async function cdp(method, params = {}, sessionId = undefined) {
     }
     return result;
 }
-// The only CDP commands whose protocol parameters include sessionId.
+// The only CDP commands whose protocol parameters include sessionId. On the
+// Target commands it names a session; on Page.screencastFrameAck it is the
+// frame number, and the browser stops sending frames until it arrives.
 const COMMANDS_WITH_SESSION_ID_PARAM = new Set([
+    "Page.screencastFrameAck",
     "Target.detachFromTarget",
     "Target.sendMessageToTarget",
 ]);
@@ -14975,9 +15012,11 @@ async function fillInPage(services, sessionId, refMap, selector, value, options 
         if (result?.kind === "contenteditable" ||
             result?.kind === "input" ||
             result?.kind === "textarea") {
-            // Some controls append because their editing state is not installed
-            // until a real pointer activation. Retry only an unchanged or appended
-            // result so application formatting is never typed twice.
+            // Some controls insert next to the old content (appending, or
+            // prepending at offset 0 like code editors) because their editing
+            // state is not installed until a real pointer activation. Retry only an
+            // unchanged or inserted result so application formatting is never
+            // typed twice.
             await clickResolvedElement(services, resolved.sessionId, actionObjectId, resolved.frameId, sessionId, iframeSessions);
             result = await prepare();
             if (typeof result?.error === "string") {
@@ -15231,13 +15270,33 @@ function classifyFillOutcome(beforeValue, expectedValue, actualValue, clearFirst
         if (clearFirst &&
             beforeDigits.length > 0 &&
             actualDigits === beforeDigits + integerExpected) {
-            return "appended";
+            return "inserted";
         }
     }
-    if (clearFirst && actual === before + expected && before.length > 0) {
-        return "appended";
+    if (clearFirst && insertedIntoBefore(before, expected, actual)) {
+        return "inserted";
     }
     return actual === before ? "unchanged" : "transformed";
+}
+/**
+ * Whether `actual` is `before` with `expected` inserted at some offset. An
+ * editor that ignores the DOM selection until a pointer activation inserts
+ * at its own caret (start, end or anywhere), keeping the old content.
+ */
+function insertedIntoBefore(before, expected, actual) {
+    if (before.length === 0 || expected.length === 0)
+        return false;
+    if (actual.length !== before.length + expected.length)
+        return false;
+    let offset = actual.indexOf(expected);
+    while (offset !== -1 && offset <= before.length) {
+        if (actual.slice(0, offset) === before.slice(0, offset) &&
+            actual.slice(offset + expected.length) === before.slice(offset)) {
+            return true;
+        }
+        offset = actual.indexOf(expected, offset + 1);
+    }
+    return false;
 }
 async function clickResolvedElement(services, sessionId, objectId, frameId, pageSessionId = sessionId, iframeSessions = new Map()) {
     const point = await resolveElementPoint(services, sessionId, objectId, {
@@ -18073,6 +18132,10 @@ class LedgerLockedError extends Error {
 }
 /** Stable across Agent rounds and Node-service restarts in one Ego Lite run. */
 function runtimeInstanceId(parentPid = process.ppid) {
+    // Linux port: ego-browser nodejs runs each script in its own short-lived
+    // Node process (there is no in-browser Node host), so process.ppid is not
+    // stable. The launcher sets EGO_BROWSER_INSTANCE_ID to an id that is stable
+    // for the lifetime of the shared Chromium instance it drives.
     const fromEnv = process.env.EGO_BROWSER_INSTANCE_ID;
     if (fromEnv !== undefined && fromEnv.length > 0)
         return fromEnv;
@@ -18927,6 +18990,10 @@ const PAGE_UNRESPONSIVE_URL_TIMEOUT_MS = 1_000;
 // Page.stopLoading is answered by the browser process; the frame-tree read
 // afterwards is what shows whether the renderer answers again.
 const PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS = 1_000;
+// A pending main-frame navigation suspends Runtime.evaluate along with every
+// other renderer command, so an answer within this budget shows the document
+// has committed and the timed-out command waits on something else.
+const PAGE_UNRESPONSIVE_PROBE_TIMEOUT_MS = 1_000;
 // The native tab list can lag the CDP target event by a few milliseconds.
 const POPUP_TAB_LIST_RETRIES = 10;
 const POPUP_TAB_LIST_RETRY_MS = 20;
@@ -19885,6 +19952,7 @@ class Page {
         return this.#withPage(page, async ({ sessionId }) => {
             await this.#activate(page.targetId);
             let root;
+            let rootFrameId;
             let rootContext;
             if (rootRefId) {
                 const refs = await this.#refMapForAction(page, sessionId, options.root);
@@ -19893,6 +19961,14 @@ class Page {
                     throw new ElementResolutionError(`Unknown ref: ${options.root}`, "permanent");
                 }
                 root = entry.backendNodeId;
+                // Backend node ids are only unique per renderer, and native snapshot
+                // prefers the main document when ids collide. A root inside an iframe
+                // must name its frame; a main-document root must not.
+                if (entry.frameId &&
+                    entry.frameProvenance === "frame" &&
+                    entry.frameId !== page.targetId) {
+                    rootFrameId = entry.frameId;
+                }
                 rootContext = {
                     ...(entry.frameId ? { frameId: entry.frameId } : {}),
                     ...(entry.frameProvenance
@@ -19906,6 +19982,7 @@ class Page {
                 const result = await this.#services.snapshot({
                     ...snapshotOptions,
                     ...(root === undefined ? {} : { root }),
+                    ...(rootFrameId === undefined ? {} : { frameId: rootFrameId }),
                     scope: snapshotScope,
                     includeActionMarks: options.includeActionMarks ?? true,
                     includeStableLocator: options.includeStableLocator ?? true,
@@ -20899,9 +20976,11 @@ class Page {
     }
     /**
      * Replace the runtime's generic "did not answer" error with one that names
-     * this Page and what happened next. The wait that just ran out was this
-     * call's whole budget, so a main-frame navigation that did not commit in it
-     * is stopped here, as goto does at its own timeout: the Page then answers
+     * this Page and what happened next. A renderer that still answers
+     * JavaScript has no pending navigation (a screenshot of a Page that has not
+     * rendered yet, for example), so nothing is stopped. Otherwise the wait that
+     * just ran out was this call's whole budget, so a main-frame navigation that
+     * did not commit in it is stopped here, as goto does at its own timeout: the Page then answers
      * again instead of costing every later call another full wait. Thrown from
      * here so the stack shows the public call instead of a transport timer.
      */
@@ -20919,11 +20998,26 @@ class Page {
         catch {
             // The URL is a courtesy; the error stands without it.
         }
+        const described = new PageUnresponsiveError(error.method, error.waitedMs, page.targetId, error.sessionId);
+        const head = `Page ${this.label}${url ? ` (${url})` : ""} did not answer ${error.method} within ${error.waitedMs}ms`;
+        // A renderer that still runs JavaScript has committed its document, so
+        // there is no pending navigation to stop. Page.stopLoading would instead
+        // abort the resources the document is still loading, such as the
+        // render-blocking stylesheet a screenshot is waiting for.
+        const readyState = error.sessionId
+            ? await probeRendererReadyState(this.#services, error.sessionId)
+            : undefined;
+        if (readyState !== undefined) {
+            described.message =
+                `${head}, but it still answers JavaScript (document.readyState is "${readyState}"), so no navigation is pending and nothing was stopped. ` +
+                    (error.method === "Page.captureScreenshot"
+                        ? "A screenshot waits for the Page to render a frame, and it has not rendered one yet, usually because render-blocking resources such as stylesheets, fonts or synchronous scripts are still loading. Wait with page.waitForLoadState() and retry; page.snapshot() and page.evaluate() work meanwhile."
+                        : "Retry the call once the Page has finished loading (page.waitForLoadState()), use page.snapshot() or page.evaluate() meanwhile, or continue on a new Page from task.newPage().");
+            return described;
+        }
         const recovered = error.sessionId
             ? await this.#stopPendingNavigation(error.sessionId)
             : "unknown";
-        const described = new PageUnresponsiveError(error.method, error.waitedMs, page.targetId, error.sessionId);
-        const head = `Page ${this.label}${url ? ` (${url})` : ""} did not answer ${error.method} within ${error.waitedMs}ms`;
         if (recovered === "hung") {
             described.message = `${head}, and still did not answer after Page.stopLoading, so its renderer is probably hung. Continue on a new Page from task.newPage(), or close this Page and open it again.`;
         }
@@ -21303,6 +21397,25 @@ async function stopPendingNavigationInSession(services, sessionId) {
     }
     catch {
         return "hung";
+    }
+}
+/**
+ * Ask the renderer for document.readyState within a short budget. Returns the
+ * state when the renderer answered, or undefined when it did not (a pending
+ * main-frame navigation or a hung renderer) or the answer was unusable.
+ */
+async function probeRendererReadyState(services, sessionId) {
+    try {
+        const response = await services.cdp("Runtime.evaluate", {
+            expression: "document.readyState",
+            returnByValue: true,
+            awaitPromise: false,
+        }, sessionId, PAGE_UNRESPONSIVE_PROBE_TIMEOUT_MS);
+        const value = response?.result?.value ?? response?.result?.result?.value;
+        return typeof value === "string" && value.length > 0 ? value : undefined;
+    }
+    catch {
+        return undefined;
     }
 }
 function isBrowserLevelMethod(method) {
@@ -22756,6 +22869,10 @@ if (isDirectCli()) {
 }
 else {
     installEgoSdk();
+    // The host runs each heredoc in a short-lived process and does not have to
+    // call disposeEgoSdk(), so process exit is the only reliable end of the SDK
+    // round. Cleanup is synchronous and idempotent, which `exit` requires.
+    process.once("exit", disposeDownloadArtifacts);
 }
 function createCliLog() {
     return (...args) => {

@@ -16,6 +16,7 @@ async function cdp(method, params = {}, sessionId = void 0) {
   return result;
 }
 const COMMANDS_WITH_SESSION_ID_PARAM = /* @__PURE__ */ new Set([
+  "Page.screencastFrameAck",
   "Target.detachFromTarget",
   "Target.sendMessageToTarget"
 ]);

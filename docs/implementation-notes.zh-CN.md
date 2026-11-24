@@ -484,3 +484,42 @@ Port 侧：
   SDK bundle 与 linux.10 完全相同，port 侧实质变化只有 VERSION、
   README 版本映射行与本文档条目；port `package.json` 不变。
 - VERSION：`0.6.0.16-linux.11`。
+
+## 2026-11-24（每日同步）：linux.12——上游 dev head 654eacc5（2026-11-21，Merge PR #773）
+
+判定：最新 v* tag 仍为 `v2.2.1`（`f499162`，2026-11-16）；`origin/main`
+HEAD 同为 `f499162`，均不新于基线（port `0.6.0.16-linux.11` 已跟踪
+`f499162`）。`origin/dev` HEAD 前进到 `654eacc5`（2026-11-21，Merge PR
+#773），即 2026-11-17 留待复核的 dev 线。核查结论：dev 是基线的合法后
+继、不是降级——merge-base 为 `fa2de6b`（v2.2.1-beta.3，linux.11 的 SDK
+基线）；`f499162` 的改动全部在 `package/` 之外，dev 不含它们但 port 不
+同步那些文件，故 port 侧无任何丢失；dev 在 `fa2de6b` 之上新增 36 个提交
+（`f499162..654eacc5` 共 82 文件、+2705/-5879 行，含 linear-autofix 退
+役等 port 外改动）。`origin/release/v2.3.0` 分支头与 dev HEAD 相同，
+尚无 v2.3.0 tag。
+
+上游变化（SDK，`package/ego-browser/src` 6 文件、+153/-17 行）：
+- `browser-runtime.ts`：新增 `pruneReplacedDocumentRequests`——被替换文
+  档遗留的在途请求不再永久阻塞 network idle（PR #726）。
+- `page-model.ts`：subtree 快照把 root 所在 frame 的 frameId 传给原生
+  快照（backend node id 只在同一 renderer 内唯一，PR #751/#770）；
+  页面无响应时先以 1s 预算探 `document.readyState`，renderer 仍能执行
+  JS 说明无待定导航、不再 `Page.stopLoading`（PR #688/#734 相关）。
+- `driver/page-actions.ts`：fill 结果 "appended" 改为 "inserted"，覆
+  盖在 offset 0 前插的代码编辑器（PR #734）。
+- `cdp-eval.ts`：`Page.screencastFrameAck` 加入允许 params 内传
+  sessionId 的命令（PR #727）。
+- `index.ts`：非 CLI 入口时进程退出即清理下载产物
+  （`disposeDownloadArtifacts`）。
+- `skills/`：Windows 安装脚本 `install.ps1`（PR #773）与安装指南更新；
+  SKILL.md 正文无改动。无新公共 API。绑定层无需改动（`src/*.js` 未动）。
+
+Port 侧：
+- 两处 Linux 补丁在新源码逐字重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支，上游仍从 ppid 派生，未变；
+  `browser-runtime.ts` 的 `enableEgoAutomation()` masking 回退），
+  上游单测 `npm test` 671/671 通过（linux.11 时为 662）。
+- `vendor/ego-browser/` 从新 worktree 构建全量同步（bundle 含双补丁
+  与新上游代码已核对）；SDK package version 仍 `0.1.0`，port
+  `package.json` 不变。
+- VERSION：`0.6.0.16-linux.12`。

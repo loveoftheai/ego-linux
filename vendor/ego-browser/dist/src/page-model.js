@@ -251,6 +251,7 @@ const MISSING_TARGET_PROBE_TIMEOUT_MS = 1e3;
 const POPUP_SYNC_TIMEOUT_MS = 1e3;
 const PAGE_UNRESPONSIVE_URL_TIMEOUT_MS = 1e3;
 const PAGE_UNRESPONSIVE_STOP_TIMEOUT_MS = 1e3;
+const PAGE_UNRESPONSIVE_PROBE_TIMEOUT_MS = 1e3;
 const POPUP_TAB_LIST_RETRIES = 10;
 const POPUP_TAB_LIST_RETRY_MS = 20;
 const POPUP_POLL_SETTLE_MS = 50;
@@ -1304,6 +1305,7 @@ class Page {
     return this.#withPage(page, async ({ sessionId }) => {
       await this.#activate(page.targetId);
       let root;
+      let rootFrameId;
       let rootContext;
       if (rootRefId) {
         const refs = await this.#refMapForAction(
@@ -1319,6 +1321,9 @@ class Page {
           );
         }
         root = entry.backendNodeId;
+        if (entry.frameId && entry.frameProvenance === "frame" && entry.frameId !== page.targetId) {
+          rootFrameId = entry.frameId;
+        }
         rootContext = {
           ...entry.frameId ? { frameId: entry.frameId } : {},
           ...entry.frameProvenance ? { frameProvenance: entry.frameProvenance } : {}
@@ -1330,6 +1335,7 @@ class Page {
         const result2 = await this.#services.snapshot({
           ...snapshotOptions,
           ...root === void 0 ? {} : { root },
+          ...rootFrameId === void 0 ? {} : { frameId: rootFrameId },
           scope: snapshotScope,
           includeActionMarks: options.includeActionMarks ?? true,
           includeStableLocator: options.includeStableLocator ?? true
@@ -2488,9 +2494,11 @@ ${overflow}`;
   }
   /**
    * Replace the runtime's generic "did not answer" error with one that names
-   * this Page and what happened next. The wait that just ran out was this
-   * call's whole budget, so a main-frame navigation that did not commit in it
-   * is stopped here, as goto does at its own timeout: the Page then answers
+   * this Page and what happened next. A renderer that still answers
+   * JavaScript has no pending navigation (a screenshot of a Page that has not
+   * rendered yet, for example), so nothing is stopped. Otherwise the wait that
+   * just ran out was this call's whole budget, so a main-frame navigation that
+   * did not commit in it is stopped here, as goto does at its own timeout: the Page then answers
    * again instead of costing every later call another full wait. Thrown from
    * here so the stack shows the public call instead of a transport timer.
    */
@@ -2507,7 +2515,6 @@ ${overflow}`;
       if (typeof info?.url === "string" && info.url.length > 0) url = info.url;
     } catch {
     }
-    const recovered = error.sessionId ? await this.#stopPendingNavigation(error.sessionId) : "unknown";
     const described = new PageUnresponsiveError(
       error.method,
       error.waitedMs,
@@ -2515,6 +2522,12 @@ ${overflow}`;
       error.sessionId
     );
     const head = `Page ${this.label}${url ? ` (${url})` : ""} did not answer ${error.method} within ${error.waitedMs}ms`;
+    const readyState = error.sessionId ? await probeRendererReadyState(this.#services, error.sessionId) : void 0;
+    if (readyState !== void 0) {
+      described.message = `${head}, but it still answers JavaScript (document.readyState is "${readyState}"), so no navigation is pending and nothing was stopped. ` + (error.method === "Page.captureScreenshot" ? "A screenshot waits for the Page to render a frame, and it has not rendered one yet, usually because render-blocking resources such as stylesheets, fonts or synchronous scripts are still loading. Wait with page.waitForLoadState() and retry; page.snapshot() and page.evaluate() work meanwhile." : "Retry the call once the Page has finished loading (page.waitForLoadState()), use page.snapshot() or page.evaluate() meanwhile, or continue on a new Page from task.newPage().");
+      return described;
+    }
+    const recovered = error.sessionId ? await this.#stopPendingNavigation(error.sessionId) : "unknown";
     if (recovered === "hung") {
       described.message = `${head}, and still did not answer after Page.stopLoading, so its renderer is probably hung. Continue on a new Page from task.newPage(), or close this Page and open it again.`;
     } else if (recovered === "unknown") {
@@ -2925,6 +2938,24 @@ async function stopPendingNavigationInSession(services, sessionId) {
     };
   } catch {
     return "hung";
+  }
+}
+async function probeRendererReadyState(services, sessionId) {
+  try {
+    const response = await services.cdp(
+      "Runtime.evaluate",
+      {
+        expression: "document.readyState",
+        returnByValue: true,
+        awaitPromise: false
+      },
+      sessionId,
+      PAGE_UNRESPONSIVE_PROBE_TIMEOUT_MS
+    );
+    const value = response?.result?.value ?? response?.result?.result?.value;
+    return typeof value === "string" && value.length > 0 ? value : void 0;
+  } catch {
+    return void 0;
   }
 }
 function isBrowserLevelMethod(method) {

@@ -114,6 +114,7 @@ if (isDirectCli()) {
   }
 } else {
   installEgoSdk();
+  process.once("exit", disposeDownloadArtifacts);
 }
 function createCliLog() {
   return (...args) => {

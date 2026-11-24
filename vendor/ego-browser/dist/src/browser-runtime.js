@@ -1038,7 +1038,28 @@ function clearIgnoredFaviconRequest(targetId, requestId) {
   }
   return deleted;
 }
+function pruneReplacedDocumentRequests(targetId, frame) {
+  const frameId = frame?.id;
+  const loaderId = frame?.loaderId;
+  if (typeof frameId !== "string" || typeof loaderId !== "string") return;
+  const now = state.now();
+  for (const pageTargetId of pageTreeTargetIds(pageRootTargetId(targetId))) {
+    const pageTarget = targetStates.get(pageTargetId);
+    if (!pageTarget) continue;
+    for (const [requestId, request] of pageTarget.inflightNetworkRequests) {
+      if (request.frameId !== frameId || request.loaderId === void 0 || request.loaderId === loaderId) {
+        continue;
+      }
+      pageTarget.inflightNetworkRequests.delete(requestId);
+      pageTarget.lastNetworkActivityAt = now;
+    }
+  }
+}
 function recordNetworkEvent(targetId, target, data) {
+  if (data.method === "Page.frameNavigated") {
+    pruneReplacedDocumentRequests(targetId, data.params?.frame);
+    return;
+  }
   if (!target.networkDomainEnabled && !target.networkEnableInflight) return;
   const requestId = data?.params?.requestId;
   if (typeof requestId !== "string" || requestId.length === 0) return;

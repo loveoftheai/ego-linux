@@ -688,13 +688,25 @@ function classifyFillOutcome(beforeValue, expectedValue, actualValue, clearFirst
     if (actualDigits === integerExpected) return "equivalent";
     const beforeDigits = before.normalize("NFKC").replace(/\D/g, "");
     if (clearFirst && beforeDigits.length > 0 && actualDigits === beforeDigits + integerExpected) {
-      return "appended";
+      return "inserted";
     }
   }
-  if (clearFirst && actual === before + expected && before.length > 0) {
-    return "appended";
+  if (clearFirst && insertedIntoBefore(before, expected, actual)) {
+    return "inserted";
   }
   return actual === before ? "unchanged" : "transformed";
+}
+function insertedIntoBefore(before, expected, actual) {
+  if (before.length === 0 || expected.length === 0) return false;
+  if (actual.length !== before.length + expected.length) return false;
+  let offset = actual.indexOf(expected);
+  while (offset !== -1 && offset <= before.length) {
+    if (actual.slice(0, offset) === before.slice(0, offset) && actual.slice(offset + expected.length) === before.slice(offset)) {
+      return true;
+    }
+    offset = actual.indexOf(expected, offset + 1);
+  }
+  return false;
 }
 async function clickResolvedElement(services, sessionId, objectId, frameId, pageSessionId = sessionId, iframeSessions = /* @__PURE__ */ new Map()) {
   const point = await resolveElementPoint(services, sessionId, objectId, {
