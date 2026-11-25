@@ -523,3 +523,48 @@ Port 侧：
   与新上游代码已核对）；SDK package version 仍 `0.1.0`，port
   `package.json` 不变。
 - VERSION：`0.6.0.16-linux.12`。
+
+## 2026-11-25（每日同步）：linux.13——上游 release/v2.3.0 分支头 82c29f5（2026-11-24，Merge PR #793）
+
+上游判定：最新 v\* tag 仍为 `v2.2.1`（`f499162`，2026-11-16）；`origin/main`
+HEAD 同为 `f499162`，均不新于基线；`origin/dev` HEAD 仍为 `654eacc5` 未动。
+`origin/release/v2.3.0` 分支头前进到 `82c29f5`（2026-11-24，Merge PR #793，
+same-space parallel），是基线 `654eacc5` 的直系后继（merge-base 即
+`654eacc5`），在其之上新增 20 个提交，尚无 v2.3.0 tag。
+
+上游变化（SDK，`package/ego-browser/src` 15 文件、+2398/-551 行）：
+- `page-model.ts`：每 tab 即 Page，取消 adopt 步骤（PR #785：`adopt()` /
+  `release()` 只剩运行时别名，调用时报引导性错误，不再是公开 API；旧
+  adopt 别名不再遮蔽规范标签）；同 task space 的 Pages 并行加载（PR #793：
+  请求按到达顺序准入、快照与 newPage 互斥、popup 归属其 Page）；新增
+  `touchTaskSpaceForRound`（`helpers.ts` 在 takeOver 时调用）。
+- `native-gate.ts`：大改（+243 行）——原生操作按 lease 排队：依赖 Ego Lite
+  进程级选中 task space 的操作持 lease，`shared`（导航/等待/读取）可并
+  行、`exclusive`（输入/生命周期）独占，同 Page 操作永远串行。
+- `page-ledger.ts`：大改（+279 行）——配合新 Page 模型与 round status 重写；
+  `runtimeInstanceId` 仍从 ppid 派生，签名未变。
+- `round-status.ts`（新增，+226 行）：每轮末尾输出所用 task space 的状态行
+  （`ready` / `user_control` / `finished` / `closed` / `unknown`，含 Page
+  标签与标题），替代旧的未处理 Page 提示与 `finish()` 提示；`output-sink.ts`
+  / `run.ts` 在脚本落定后刷新状态（PR #790：超时刷新不写 ledger、不把
+  用户收回的空间变成 hard stop）。
+- `page-discovery.ts`：+9 行（Page notice 相关）。
+- `public-api-schema.ts`：`TaskSpace.adopt` / `TaskSpace.release` 条目移除；
+  `pages` / `tabs` / `finish` 摘要按新模型改写。无新公共 API。
+- `skill-body/SKILL.md`：adopt/release 文档删除，改写为“受控空间内每个 tab
+  都是可直接操作的 Page”；新增每轮末尾状态行示例与格式；`skills/` 与
+  `plugins/` 入口 Skill：压缩/总结后重读 skill 的提示（PR #792）。
+- 另有 e2e 用例新增（`page-parallel.mjs`、`page-labels.mjs` 大改）与
+  `AGENTS.md` 规约同步（round status、并行加载、E2E 指纹跳过规则）。
+  绑定层无需改动（`src/*.js` 未动；port 内唯一 `.adopt(` 引用是旧
+  `sdk/ego-browser/SKILL.md` 里的文档示例，已随新 SKILL.md 同步更新）。
+
+Port 侧：
+- 两处 Linux 补丁在新源码逐字重打（`page-ledger.ts` 的
+  `EGO_BROWSER_INSTANCE_ID` 优先分支，上游仍从 ppid 派生，未变；
+  `browser-runtime.ts` 的 `enableEgoAutomation()` masking 回退），
+  上游单测 `npm test` 712/712 通过（linux.12 时为 671，+41 为新 PR 测试）。
+- `vendor/ego-browser/` 从新 worktree 构建全量同步（bundle 含双补丁与
+  新上游代码已核对）；SDK package version 仍 `0.1.0`，port
+  `package.json` 不变。
+- VERSION：`0.6.0.16-linux.13`。

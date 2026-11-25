@@ -1,6 +1,12 @@
 const pendingPageNotices = /* @__PURE__ */ new Map();
 const observedPages = /* @__PURE__ */ new Set();
 const pageNoticeListeners = /* @__PURE__ */ new Set();
+const onceNoticeKeys = /* @__PURE__ */ new Set();
+function firstNoticeThisRound(key) {
+  if (onceNoticeKeys.has(key)) return false;
+  onceNoticeKeys.add(key);
+  return true;
+}
 function recordUnhandledPage(notice) {
   const key = pageKey(notice.spaceId, notice.targetId);
   if (observedPages.has(key)) return;
@@ -52,6 +58,7 @@ function resetPageNotices() {
   pendingPageNotices.clear();
   observedPages.clear();
   pageNoticeListeners.clear();
+  onceNoticeKeys.clear();
 }
 function pageKey(spaceId, targetId) {
   return `${spaceId}:${targetId}`;
@@ -59,6 +66,7 @@ function pageKey(spaceId, targetId) {
 export {
   clearSpacePageNotices,
   consumeUnhandledPageNotices,
+  firstNoticeThisRound,
   forgetPageNotice,
   markPageObserved,
   peekUnhandledPageNotices,

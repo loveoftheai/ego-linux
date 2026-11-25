@@ -10,6 +10,7 @@ import { addPageContextHint } from "./page-context-guard.js";
 import {
   bufferOutput,
   createRoundConsole,
+  finalizeRoundStatus,
   flushSink,
   resetSink
 } from "./output-sink.js";
@@ -76,9 +77,11 @@ ${code}`);
   try {
     await fn(...values);
   } catch (error) {
+    await finalizeRoundStatus();
     flushSink(stdout, true);
     throw addPageContextHint(error);
   }
+  await finalizeRoundStatus();
   flushSink(stdout, false);
 }
 function userScriptSyntaxError(code, original) {

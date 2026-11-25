@@ -70,7 +70,11 @@ class PageLedgerStore {
     await this.#cleanupExpiredLedgers(browserInstanceId);
     const ledger = emptyLedger(spaceId, browserInstanceId);
     const label = nextAutomaticLabel(ledger, /* @__PURE__ */ new Set());
-    const entry = { targetId, openedBy: "agent" };
+    const entry = {
+      targetId,
+      openedBy: "agent",
+      createdInTask: true
+    };
     ledger.initialized = true;
     ledger.usedLabels.push(label);
     ledger.pages[label] = entry;
@@ -88,20 +92,20 @@ class PageLedgerStore {
     await this.#removeAll(await this.#listVersions(spaceId, browserInstanceId));
   }
   /**
-   * End a task whose space stays open for the user. Labels end with the task,
-   * but the origin of the tabs the agent left open survives so a later claim
-   * does not mistake them for user tabs. The ledger stays uninitialized: every
-   * other tab found at the claim is still treated as unknown.
+   * End a task whose space stays open for the user. The Pages left open keep
+   * their labels and origin, so a later claim continues with the same labels
+   * and closes only the agent's own Pages. Label numbering continues, the
+   * Pages stop counting against the budget, and tabs the user opens before
+   * the next claim are recorded as unknown origin.
    */
-  async retainForUser(spaceId, targetIds) {
-    assertSpaceId(spaceId);
-    targetIds.forEach(assertTargetId);
-    const ledger = emptyLedger(spaceId, await this.#currentBrowserInstanceId());
-    for (const targetId of targetIds) {
-      ledger.unmanagedTargets[targetId] = "agent";
-    }
-    ledger.retainedTargets = [...targetIds];
-    await this.#writeLatest(spaceId, ledger);
+  async retainForUser(spaceId) {
+    await this.#update(spaceId, (ledger) => {
+      for (const page of Object.values(ledger.pages)) {
+        delete page.createdInTask;
+      }
+      ledger.retainedTargets = [];
+      ledger.userControlPending = true;
+    });
   }
   async getPage(spaceId, label) {
     assertLabel(label);
@@ -118,7 +122,6 @@ class PageLedgerStore {
   }
   async addPage(spaceId, targetId, options = {}) {
     assertTargetId(targetId);
-    if (options.as !== void 0) assertLabel(options.as);
     let added;
     await this.#update(spaceId, (ledger) => {
       const existing = Object.entries(ledger.pages).find(
@@ -127,14 +130,12 @@ class PageLedgerStore {
       if (existing) {
         throw new Error(`target ${targetId} is already page ${existing[0]}`);
       }
-      const used = new Set(ledger.usedLabels);
-      const label = options.as || nextAutomaticLabel(ledger, used);
-      if (used.has(label)) {
-        throw new Error(`page label already used: ${label}`);
-      }
+      const label = nextAutomaticLabel(ledger, new Set(ledger.usedLabels));
+      const openedBy = options.openedBy || "agent";
       const entry = {
         targetId,
-        openedBy: options.openedBy || "agent"
+        openedBy,
+        ...openedBy === "agent" ? { createdInTask: true } : {}
       };
       ledger.initialized = true;
       delete ledger.unmanagedTargets[targetId];
@@ -171,27 +172,6 @@ class PageLedgerStore {
     });
     return removed;
   }
-  async releasePage(spaceId, label) {
-    assertLabel(label);
-    let removed;
-    await this.#update(spaceId, (ledger) => {
-      const entry = ledger.pages[label];
-      if (!entry) {
-        if (ledger.releasedLabels.includes(label)) {
-          throw new Error(`page ${label} was released`);
-        }
-        if (ledger.usedLabels.includes(label)) {
-          throw new Error(`page ${label} was closed`);
-        }
-        throw new Error(`page label not found: ${label}`);
-      }
-      removed = { label, ...entry };
-      delete ledger.pages[label];
-      ledger.releasedLabels.push(label);
-      ledger.unmanagedTargets[entry.targetId] = entry.openedBy;
-    });
-    return removed;
-  }
   async keepUnmanaged(spaceId, targetId, openedBy = "unknown") {
     assertTargetId(targetId);
     if (!["agent", "unknown"].includes(openedBy)) {
@@ -223,73 +203,67 @@ class PageLedgerStore {
   async reconcile(spaceId, liveTargetIds, options = {}) {
     const live = new Set(liveTargetIds);
     const current = await this.read(spaceId);
+    options.signal?.throwIfAborted();
     const hasMissingPage = Object.values(current.pages).some(
       (page) => !live.has(page.targetId)
     );
     const hasMissingUnmanaged = Object.keys(current.unmanagedTargets).some(
       (targetId) => !live.has(targetId)
     );
-    const knownTargets = /* @__PURE__ */ new Set([
-      ...Object.values(current.pages).map((page) => page.targetId),
-      ...Object.keys(current.unmanagedTargets)
-    ]);
-    const newTargets = [...live].filter(
-      (targetId) => !knownTargets.has(targetId)
-    );
-    const needsInitialization = !current.initialized;
-    const protectsUserTabs = options.afterUserControl || current.userControlPending;
-    const shouldAdopt = current.initialized && options.autoAdoptNew && !protectsUserTabs && newTargets.length > 0;
-    if (!hasMissingPage && !hasMissingUnmanaged && !needsInitialization && !protectsUserTabs && !shouldAdopt) {
+    const blank = options.blankTargetIds ? new Set(options.blankTargetIds) : void 0;
+    const atUserBoundary = (ledger) => !ledger.initialized || options.afterUserControl === true || ledger.userControlPending;
+    const usedAnchors = (ledger) => blank && atUserBoundary(ledger) ? blank : void 0;
+    const unlabeled = unlabeledTargets(current, live, usedAnchors(current));
+    const needsLabels = options.assignLabels === true && (unlabeled.length > 0 || !current.initialized || current.userControlPending || current.retainedTargets.length > 0);
+    if (!hasMissingPage && !hasMissingUnmanaged && !needsLabels) {
       return current;
     }
-    return this.#update(spaceId, (ledger) => {
-      for (const [label, page] of Object.entries(ledger.pages)) {
-        if (!live.has(page.targetId)) delete ledger.pages[label];
-      }
-      for (const targetId of Object.keys(ledger.unmanagedTargets)) {
-        if (!live.has(targetId)) delete ledger.unmanagedTargets[targetId];
-      }
-      ledger.retainedTargets = ledger.retainedTargets.filter(
-        (targetId) => live.has(targetId)
-      );
-      const managedTargets = new Set(
-        Object.values(ledger.pages).map((page) => page.targetId)
-      );
-      const untracked = [...live].filter(
-        (targetId) => !managedTargets.has(targetId) && !Object.hasOwn(ledger.unmanagedTargets, targetId)
-      );
-      if (!ledger.initialized) {
-        for (const targetId of untracked) {
-          ledger.unmanagedTargets[targetId] = "unknown";
+    return this.#update(
+      spaceId,
+      (ledger) => {
+        for (const [label, page] of Object.entries(ledger.pages)) {
+          if (!live.has(page.targetId)) delete ledger.pages[label];
         }
+        for (const targetId of Object.keys(ledger.unmanagedTargets)) {
+          if (!live.has(targetId)) delete ledger.unmanagedTargets[targetId];
+        }
+        ledger.retainedTargets = ledger.retainedTargets.filter(
+          (targetId) => live.has(targetId)
+        );
+        if (!options.assignLabels) return;
+        const fromUser = atUserBoundary(ledger);
+        const retained = new Set(ledger.retainedTargets);
+        const used = new Set(ledger.usedLabels);
+        for (const targetId of unlabeledTargets(
+          ledger,
+          live,
+          usedAnchors(ledger)
+        )) {
+          const legacyOrigin = ledger.unmanagedTargets[targetId];
+          const openedBy = retained.has(targetId) ? "agent" : legacyOrigin === "unknown" || fromUser ? "unknown" : "agent";
+          const createdInTask = openedBy === "agent" && !retained.has(targetId) && !fromUser;
+          const label = nextAutomaticLabel(ledger, used);
+          used.add(label);
+          ledger.usedLabels.push(label);
+          ledger.pages[label] = {
+            targetId,
+            openedBy,
+            ...createdInTask ? { createdInTask: true } : {}
+          };
+          delete ledger.unmanagedTargets[targetId];
+        }
+        ledger.retainedTargets = [];
         ledger.initialized = true;
         ledger.userControlPending = false;
-        return;
-      }
-      if (protectsUserTabs) {
-        for (const targetId of untracked) {
-          ledger.unmanagedTargets[targetId] = "unknown";
-        }
-        ledger.userControlPending = false;
-        return;
-      }
-      if (!options.autoAdoptNew) return;
-      const used = new Set(ledger.usedLabels);
-      for (const targetId of untracked) {
-        const label = nextAutomaticLabel(ledger, used);
-        used.add(label);
-        ledger.usedLabels.push(label);
-        ledger.pages[label] = {
-          targetId,
-          openedBy: "agent"
-        };
-      }
-    });
+      },
+      options.signal
+    );
   }
-  async #update(spaceId, mutate) {
+  async #update(spaceId, mutate, signal) {
     assertSpaceId(spaceId);
     for (let conflicts = 0; ; conflicts++) {
       const { ledger, files } = await this.#load(spaceId);
+      signal?.throwIfAborted();
       mutate(ledger);
       try {
         await this.#write(spaceId, ledger, files);
@@ -521,6 +495,7 @@ function emptyLedger(spaceId, browserInstanceId) {
     userControlPending: false,
     unmanagedTargets: {},
     retainedTargets: [],
+    budgetTracked: true,
     pages: {}
   };
 }
@@ -530,6 +505,15 @@ function ledgerBrowserInstanceId(value) {
   }
   const browserInstanceId = value.browserInstanceId;
   return typeof browserInstanceId === "string" && browserInstanceId.length > 0 ? browserInstanceId : void 0;
+}
+function unlabeledTargets(ledger, live, blankTargets) {
+  const managed = new Set(
+    Object.values(ledger.pages).map((page) => page.targetId)
+  );
+  const retained = new Set(ledger.retainedTargets);
+  return [...live].filter(
+    (targetId) => !managed.has(targetId) && (ledger.unmanagedTargets[targetId] !== "agent" || retained.has(targetId) || blankTargets !== void 0 && !blankTargets.has(targetId))
+  );
 }
 function nextAutomaticLabel(ledger, used) {
   let sequence = ledger.nextLabel;
@@ -552,6 +536,7 @@ function validateLedger(value, expectedSpaceId, path) {
   const userControlPending = stored.userControlPending ?? (legacyHandoffBaseline !== void 0 && legacyHandoffBaseline !== null);
   const unmanagedTargets = stored.unmanagedTargets ?? {};
   const retainedTargets = stored.retainedTargets ?? [];
+  const legacyBudget = stored.budgetTracked !== true;
   if (stored.browserInstanceId !== void 0 && (typeof stored.browserInstanceId !== "string" || stored.browserInstanceId.length === 0) || stored.spaceId !== expectedSpaceId || !Number.isInteger(stored.nextLabel) || stored.nextLabel < 1 || !Array.isArray(stored.usedLabels) || stored.usedLabels.some((label) => typeof label !== "string") || !Array.isArray(releasedLabels) || releasedLabels.some(
     (label) => typeof label !== "string" || !stored.usedLabels.includes(label) || Object.hasOwn(stored.pages || {}, label)
   ) || typeof initialized !== "boolean" || typeof userControlPending !== "boolean" || legacyHandoffBaseline !== void 0 && legacyHandoffBaseline !== null && (!Array.isArray(legacyHandoffBaseline) || legacyHandoffBaseline.some(
@@ -565,7 +550,7 @@ function validateLedger(value, expectedSpaceId, path) {
   }
   const pages = {};
   for (const [label, page] of Object.entries(stored.pages)) {
-    if (!stored.usedLabels.includes(label) || !page || typeof page.targetId !== "string" || !["agent", "user", "unknown"].includes(page.openedBy)) {
+    if (!stored.usedLabels.includes(label) || !page || typeof page.targetId !== "string" || !["agent", "user", "unknown"].includes(page.openedBy) || page.createdInTask !== void 0 && typeof page.createdInTask !== "boolean") {
       throw new Error(`invalid page ledger ${path}: invalid page ${label}`);
     }
     if (Object.hasOwn(unmanagedTargets, page.targetId)) {
@@ -576,6 +561,7 @@ function validateLedger(value, expectedSpaceId, path) {
     pages[label] = {
       targetId: page.targetId,
       openedBy: normalizePageOrigin(page.openedBy),
+      ...page.createdInTask || legacyBudget && normalizePageOrigin(page.openedBy) === "agent" ? { createdInTask: true } : {},
       ...page.refs === void 0 ? {} : { refs: validatePageRefState(page.refs) }
     };
   }
@@ -595,6 +581,7 @@ function validateLedger(value, expectedSpaceId, path) {
     userControlPending,
     unmanagedTargets: normalizedUnmanagedTargets,
     retainedTargets: [...retainedTargets],
+    budgetTracked: true,
     pages
   };
 }

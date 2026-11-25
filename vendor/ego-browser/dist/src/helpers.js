@@ -19,6 +19,7 @@ import {
   captureTaskSpaceUserBoundary,
   createTaskSpaceHandle,
   initializeTaskSpaceHandle,
+  touchTaskSpaceForRound,
   rollbackCreatedTaskSpace
 } from "./page-model.js";
 import {
@@ -339,6 +340,7 @@ async function takeOverTaskSpace(nameOrId) {
   await invokeEgo("takeOverTaskSpace", () => ego.takeOverTaskSpace());
   if (descriptor) {
     const task = createTaskSpaceHandle({ ...descriptor, ownership: "agent" });
+    touchTaskSpaceForRound(task);
     if (descriptor.ownership === "agentDelegatedToUser") {
       await captureTaskSpaceUserBoundary(task);
     }
